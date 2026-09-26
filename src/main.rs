@@ -3,6 +3,7 @@ mod collector;
 mod db;
 mod fleet;
 mod geo;
+mod inference;
 mod mpk;
 mod open_data;
 mod open_meteo;
@@ -25,6 +26,7 @@ use tracing_subscriber::EnvFilter;
 use crate::collector::VehicleCollector;
 use crate::db::{Db, OpenMode};
 use crate::fleet::FleetCollector;
+use crate::inference::InferenceSettings;
 use crate::open_meteo::Area;
 use crate::weather::WeatherCollector;
 
@@ -163,6 +165,30 @@ struct FleetArgs {
     /// The open data vehicle list is refreshed about every 15 minutes
     #[arg(long, env = "MPK_FLEET_INTERVAL_SECS", default_value_t = 900, value_parser = clap::value_parser!(u64).range(1..))]
     fleet_interval_secs: u64,
+
+    /// Whether to copy a matched vehicle to the brigade's previous and next course on the same line
+    #[arg(long, env = "MPK_FLEET_INFERENCE", value_enum, default_value_t = CollectorMode::Enabled)]
+    fleet_inference: CollectorMode,
+
+    /// Longest break between one course's end and the next course's start to treat them as one brigade
+    #[arg(long, env = "MPK_FLEET_INFERENCE_MAX_GAP_SECS", default_value_t = 2700)]
+    fleet_inference_max_gap_secs: u64,
+
+    /// Largest distance between one course's end and the next course's start to treat them as one brigade
+    #[arg(long, env = "MPK_FLEET_INFERENCE_MAX_DISTANCE_METERS", default_value_t = 500.0, value_parser = parse_meters)]
+    fleet_inference_max_distance_meters: f64,
+}
+
+impl FleetArgs {
+    fn inference(&self) -> Result<Option<InferenceSettings>> {
+        if let CollectorMode::Disabled = self.fleet_inference {
+            return Ok(None);
+        }
+        Ok(Some(InferenceSettings {
+            max_gap_secs: i64::try_from(self.fleet_inference_max_gap_secs)?,
+            max_distance_m: self.fleet_inference_max_distance_meters,
+        }))
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -270,7 +296,11 @@ async fn collect(
             return Ok(());
         }
         info!("matching courses to fleet open data");
-        let mut fleet = FleetCollector::new(open_data::Client::new(http.clone())?, db.clone());
+        let mut fleet = FleetCollector::new(
+            open_data::Client::new(http.clone())?,
+            db.clone(),
+            fleet_args.inference()?,
+        );
         run_every(
             "fleet",
             Duration::from_secs(fleet_args.fleet_interval_secs),

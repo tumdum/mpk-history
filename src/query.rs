@@ -5,7 +5,9 @@ use anyhow::{Context, Result, bail};
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, civil};
 
-use crate::db::{self, BoundingBox, Db, FleetVehicle, PathPoint, PositionFilter, StoredPosition};
+use crate::db::{
+    self, BoundingBox, Db, FleetVehicle, MatchSource, PathPoint, PositionFilter, StoredPosition,
+};
 use crate::{open_data, speed};
 
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
@@ -13,6 +15,7 @@ const KM_PER_DEGREE_LATITUDE: f64 = 111.32;
 const UNKNOWN_FLEET_VALUE: &str = "-";
 const FLEET_VALUE_SEPARATOR: &str = "/";
 const UNKNOWN_SPEED: &str = "-";
+const INFERRED_MARKER: &str = "*";
 const SPEED_WINDOW: Duration = Duration::from_secs(60);
 
 pub fn parse_time(input: &str) -> Result<Timestamp> {
@@ -72,9 +75,16 @@ pub async fn print_positions(
         "HERE SINCE",
         "LAST SEEN"
     );
+    let mut any_inferred = false;
     for position in positions {
         let speed = speeds.get(&(position.line_id, position.course_id)).copied();
-        print_position(&position, fleet.get(&position.course_id), speed)?;
+        let vehicles = fleet.get(&position.course_id);
+        any_inferred |= vehicles
+            .is_some_and(|vehicles| vehicles.iter().any(|v| v.source == MatchSource::Inferred));
+        print_position(&position, vehicles, speed)?;
+    }
+    if any_inferred {
+        println!("{INFERRED_MARKER} inferred from the brigade's previous or next course");
     }
     Ok(())
 }
@@ -122,7 +132,7 @@ fn print_position(
         position.vehicle_type.as_str(),
         position.line,
         position.course_id,
-        format_fleet(fleet, |vehicle| Some(vehicle.side_number.to_string())),
+        format_fleet(fleet, |vehicle| Some(format_side_number(vehicle))),
         format_fleet(fleet, |vehicle| vehicle.plate.clone()),
         format_fleet(fleet, |vehicle| vehicle.brigade.clone()),
         speed_kmh.map_or_else(|| UNKNOWN_SPEED.to_owned(), |speed| format!("{speed:.1}")),
@@ -190,6 +200,13 @@ fn width_km(bbox: &BoundingBox) -> f64 {
     (bbox.east.degrees() - bbox.west.degrees())
         * KM_PER_DEGREE_LATITUDE
         * middle_latitude.to_radians().cos()
+}
+
+fn format_side_number(vehicle: &FleetVehicle) -> String {
+    match vehicle.source {
+        MatchSource::Matched => vehicle.side_number.to_string(),
+        MatchSource::Inferred => format!("{}{INFERRED_MARKER}", vehicle.side_number),
+    }
 }
 
 fn format_fleet(

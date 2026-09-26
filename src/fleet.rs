@@ -4,12 +4,14 @@ use std::time::Duration;
 use anyhow::Result;
 use tracing::info;
 
-use crate::db::{ActivePosition, CourseVehicle, Db};
+use crate::db::{self, ActivePosition, CourseVehicle, Db, MatchSource};
 use crate::geo;
+use crate::inference::{self, InferenceSettings};
 use crate::open_data::{Client, VehicleRecord};
 
 const MATCH_RADIUS_M: f64 = 20.0;
 const TIME_SLACK: Duration = Duration::from_secs(30);
+const INFERENCE_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Debug, PartialEq)]
 enum Outcome {
@@ -62,14 +64,16 @@ struct Counts {
 pub struct FleetCollector {
     client: Client,
     db: Db,
+    inference: Option<InferenceSettings>,
     processed: HashMap<i64, i64>,
 }
 
 impl FleetCollector {
-    pub fn new(client: Client, db: Db) -> Self {
+    pub fn new(client: Client, db: Db, inference: Option<InferenceSettings>) -> Self {
         Self {
             client,
             db,
+            inference,
             processed: HashMap::new(),
         }
     }
@@ -102,13 +106,15 @@ impl FleetCollector {
                         brigade: record.brigade.clone(),
                         observed_unix: record.updated_unix,
                         distance_m,
+                        source: MatchSource::Matched,
+                        inferred_from_course_id: None,
                     });
                 }
                 Outcome::Ambiguous => counts.ambiguous += 1,
                 Outcome::NoMatch => counts.unmatched += 1,
             }
         }
-        let inserted = self.db.save_course_vehicles(&vehicles).await?;
+        let saved = self.db.save_course_vehicles(&vehicles).await?;
         for record in &records {
             self.processed
                 .insert(record.side_number, record.updated_unix);
@@ -117,10 +123,34 @@ impl FleetCollector {
             records = records.len(),
             unchanged = counts.unchanged,
             matched = counts.matched,
-            new = inserted,
+            new = saved.inserted,
+            corrected_inferences = saved.corrected,
+            removed_inferences = saved.removed,
             ambiguous = counts.ambiguous,
             unmatched = counts.unmatched,
             "saved fleet matches"
+        );
+        self.infer_recent().await
+    }
+
+    async fn infer_recent(&self) -> Result<()> {
+        let Some(settings) = &self.inference else {
+            return Ok(());
+        };
+        let now_unix = jiff::Timestamp::now().as_second();
+        let summaries = self
+            .db
+            .course_summaries(now_unix - db::duration_secs(INFERENCE_WINDOW), now_unix)
+            .await?;
+        let course_ids: Vec<i64> = summaries.iter().map(|s| s.course_id).collect();
+        let known = self.db.course_vehicles(&course_ids).await?;
+        let inferred = inference::infer(&summaries, &known, settings);
+        let saved = self.db.save_course_vehicles(&inferred).await?;
+        info!(
+            courses = summaries.len(),
+            known = known.len(),
+            inferred = saved.inserted,
+            "saved fleet inferences"
         );
         Ok(())
     }
