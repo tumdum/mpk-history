@@ -5,13 +5,15 @@ use anyhow::{Context, Result, bail};
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, civil};
 
-use crate::db::{BoundingBox, Db, PositionFilter, StoredPosition};
-use crate::open_data;
+use crate::db::{self, BoundingBox, Db, FleetVehicle, PathPoint, PositionFilter, StoredPosition};
+use crate::{open_data, speed};
 
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 const KM_PER_DEGREE_LATITUDE: f64 = 111.32;
-const UNKNOWN_SIDE_NUMBER: &str = "-";
-const SIDE_NUMBER_SEPARATOR: &str = "/";
+const UNKNOWN_FLEET_VALUE: &str = "-";
+const FLEET_VALUE_SEPARATOR: &str = "/";
+const UNKNOWN_SPEED: &str = "-";
+const SPEED_WINDOW: Duration = Duration::from_secs(60);
 
 pub fn parse_time(input: &str) -> Result<Timestamp> {
     if let Ok(timestamp) = input.parse::<Timestamp>() {
@@ -54,24 +56,76 @@ pub async fn print_positions(
         positions.len()
     );
     let course_ids: Vec<i64> = positions.iter().map(|p| p.course_id).collect();
-    let side_numbers = db.side_numbers(&course_ids).await?;
+    let fleet = db.fleet_vehicles(&course_ids).await?;
+    let speeds = speeds_kmh(db, &positions, at.as_second()).await?;
     println!(
-        "{:<5} {:<5} {:>10} {:>9} {:>10} {:>10}  {:<19}  {:<19}",
-        "TYPE", "LINE", "COURSE", "SIDE", "LATITUDE", "LONGITUDE", "HERE SINCE", "LAST SEEN"
+        "{:<5} {:<5} {:>10} {:>9} {:<9} {:<7} {:>6} {:>10} {:>10}  {:<19}  {:<19}",
+        "TYPE",
+        "LINE",
+        "COURSE",
+        "SIDE",
+        "PLATE",
+        "BRIGADE",
+        "KM/H",
+        "LATITUDE",
+        "LONGITUDE",
+        "HERE SINCE",
+        "LAST SEEN"
     );
     for position in positions {
-        print_position(&position, &side_numbers)?;
+        let speed = speeds.get(&(position.line_id, position.course_id)).copied();
+        print_position(&position, fleet.get(&position.course_id), speed)?;
     }
     Ok(())
 }
 
-fn print_position(position: &StoredPosition, side_numbers: &HashMap<i64, Vec<i64>>) -> Result<()> {
+async fn speeds_kmh(
+    db: &Db,
+    positions: &[StoredPosition],
+    at_unix: i64,
+) -> Result<HashMap<(i64, i64), f64>> {
+    let mut vehicles_per_course: HashMap<(i64, i64), usize> = HashMap::new();
+    for position in positions {
+        *vehicles_per_course
+            .entry((position.line_id, position.course_id))
+            .or_default() += 1;
+    }
+    let courses: Vec<(i64, i64)> = vehicles_per_course
+        .iter()
+        .filter(|(_, vehicles)| **vehicles == 1)
+        .map(|(course, _)| *course)
+        .collect();
+    let window_start_unix = at_unix - db::duration_secs(SPEED_WINDOW);
+    let points = db.path_points(&courses, window_start_unix, at_unix).await?;
+    let mut paths: HashMap<(i64, i64), Vec<PathPoint>> = HashMap::new();
+    for point in points {
+        paths
+            .entry((point.line_id, point.course_id))
+            .or_default()
+            .push(point);
+    }
+    Ok(paths
+        .into_iter()
+        .filter_map(|(course, path)| {
+            speed::average_speed_kmh(&path, window_start_unix, at_unix).map(|speed| (course, speed))
+        })
+        .collect())
+}
+
+fn print_position(
+    position: &StoredPosition,
+    fleet: Option<&Vec<FleetVehicle>>,
+    speed_kmh: Option<f64>,
+) -> Result<()> {
     println!(
-        "{:<5} {:<5} {:>10} {:>9} {:>10.6} {:>10.6}  {:<19}  {:<19}",
+        "{:<5} {:<5} {:>10} {:>9} {:<9} {:<7} {:>6} {:>10.6} {:>10.6}  {:<19}  {:<19}",
         position.vehicle_type.as_str(),
         position.line,
         position.course_id,
-        format_side_numbers(side_numbers.get(&position.course_id)),
+        format_fleet(fleet, |vehicle| Some(vehicle.side_number.to_string())),
+        format_fleet(fleet, |vehicle| vehicle.plate.clone()),
+        format_fleet(fleet, |vehicle| vehicle.brigade.clone()),
+        speed_kmh.map_or_else(|| UNKNOWN_SPEED.to_owned(), |speed| format!("{speed:.1}")),
         position.latitude.degrees(),
         position.longitude.degrees(),
         format_time(position.first_seen_unix)?,
@@ -138,15 +192,18 @@ fn width_km(bbox: &BoundingBox) -> f64 {
         * middle_latitude.to_radians().cos()
 }
 
-fn format_side_numbers(side_numbers: Option<&Vec<i64>>) -> String {
-    let Some(side_numbers) = side_numbers else {
-        return UNKNOWN_SIDE_NUMBER.to_owned();
+fn format_fleet(
+    fleet: Option<&Vec<FleetVehicle>>,
+    value: impl Fn(&FleetVehicle) -> Option<String>,
+) -> String {
+    let Some(fleet) = fleet else {
+        return UNKNOWN_FLEET_VALUE.to_owned();
     };
-    side_numbers
+    fleet
         .iter()
-        .map(i64::to_string)
+        .map(|vehicle| value(vehicle).unwrap_or_else(|| UNKNOWN_FLEET_VALUE.to_owned()))
         .collect::<Vec<_>>()
-        .join(SIDE_NUMBER_SEPARATOR)
+        .join(FLEET_VALUE_SEPARATOR)
 }
 
 fn format_time(unix: i64) -> Result<String> {

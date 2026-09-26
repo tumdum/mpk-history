@@ -5,7 +5,7 @@ use anyhow::Result;
 use tracing::{debug, info, warn};
 
 use crate::db::{self, Db};
-use crate::geo::MicroDegrees;
+use crate::geo::{self, MicroDegrees};
 use crate::mpk::{Client, Line, Position, VehicleType};
 
 const MAX_MISSED_FETCHES: u32 = 3;
@@ -38,8 +38,10 @@ struct Tracked {
 
 impl Tracked {
     fn can_extend(&self, position: &Position, now_unix: i64, limits: &Limits) -> bool {
-        self.latitude == position.latitude
-            && self.longitude == position.longitude
+        geo::distance_m(
+            (self.latitude, self.longitude),
+            (position.latitude, position.longitude),
+        ) <= limits.min_move_m
             && now_unix - self.last_seen_unix <= limits.max_gap_secs
             && now_unix - self.first_seen_unix <= limits.max_span_secs
     }
@@ -48,6 +50,7 @@ impl Tracked {
 struct Limits {
     max_gap_secs: i64,
     max_span_secs: i64,
+    min_move_m: f64,
 }
 
 #[derive(Default)]
@@ -71,12 +74,13 @@ struct Tracker {
 }
 
 impl Tracker {
-    fn new(interval: Duration) -> Self {
+    fn new(interval: Duration, min_move_m: f64) -> Self {
         Self {
             vehicles: HashMap::new(),
             limits: Limits {
                 max_gap_secs: db::duration_secs(interval * MAX_MISSED_FETCHES),
                 max_span_secs: db::duration_secs(db::MAX_ROW_SPAN),
+                min_move_m,
             },
         }
     }
@@ -136,11 +140,17 @@ pub struct VehicleCollector {
 }
 
 impl VehicleCollector {
-    pub fn new(client: Client, db: Db, interval: Duration, lines_refresh: Duration) -> Self {
+    pub fn new(
+        client: Client,
+        db: Db,
+        interval: Duration,
+        lines_refresh: Duration,
+        min_move_m: f64,
+    ) -> Self {
         Self {
             client,
             db,
-            tracker: Tracker::new(interval),
+            tracker: Tracker::new(interval, min_move_m),
             lines: Vec::new(),
             lines_fetched_at: None,
             lines_refresh,
@@ -203,6 +213,13 @@ mod tests {
 
     const INTERVAL: Duration = Duration::from_secs(10);
     const INTERVAL_SECS: i64 = 10;
+    const MIN_MOVE_M: f64 = 2.0;
+    const EXACT_MATCH_M: f64 = 0.0;
+    const METERS_PER_DEGREE_LATITUDE: f64 = 111_320.0;
+
+    fn north_of(latitude: f64, meters: f64) -> f64 {
+        latitude + meters / METERS_PER_DEGREE_LATITUDE
+    }
 
     fn position(course_id: i64, latitude: f64, longitude: f64) -> Position {
         Position {
@@ -234,7 +251,7 @@ mod tests {
 
     #[test]
     fn extends_unchanged_and_inserts_moved() {
-        let mut tracker = Tracker::new(INTERVAL);
+        let mut tracker = Tracker::new(INTERVAL, MIN_MOVE_M);
         let mut next_id = 0;
         let first = [position(1, 51.0, 17.0), position(2, 51.1, 17.1)];
         assert_eq!(step(&mut tracker, &first, 0, &mut next_id), (2, vec![]));
@@ -252,8 +269,54 @@ mod tests {
     }
 
     #[test]
+    fn ignores_jitter_within_min_move() {
+        let mut tracker = Tracker::new(INTERVAL, MIN_MOVE_M);
+        let mut next_id = 0;
+        step(&mut tracker, &[position(1, 51.0, 17.0)], 0, &mut next_id);
+        let jitter = [position(1, north_of(51.0, 1.0), 17.0)];
+        assert_eq!(
+            step(&mut tracker, &jitter, INTERVAL_SECS, &mut next_id),
+            (0, vec![1])
+        );
+    }
+
+    #[test]
+    fn measures_creep_from_where_the_row_started() {
+        let mut tracker = Tracker::new(INTERVAL, MIN_MOVE_M);
+        let mut next_id = 0;
+        step(&mut tracker, &[position(1, 51.0, 17.0)], 0, &mut next_id);
+        let small_step = [position(1, north_of(51.0, 1.5), 17.0)];
+        assert_eq!(
+            step(&mut tracker, &small_step, INTERVAL_SECS, &mut next_id),
+            (0, vec![1])
+        );
+        let past_limit = [position(1, north_of(51.0, 3.0), 17.0)];
+        assert_eq!(
+            step(&mut tracker, &past_limit, 2 * INTERVAL_SECS, &mut next_id),
+            (1, vec![])
+        );
+    }
+
+    #[test]
+    fn zero_min_move_extends_only_exact_positions() {
+        let mut tracker = Tracker::new(INTERVAL, EXACT_MATCH_M);
+        let mut next_id = 0;
+        let parked = [position(1, 51.0, 17.0)];
+        step(&mut tracker, &parked, 0, &mut next_id);
+        assert_eq!(
+            step(&mut tracker, &parked, INTERVAL_SECS, &mut next_id),
+            (0, vec![1])
+        );
+        let moved = [position(1, north_of(51.0, 0.2), 17.0)];
+        assert_eq!(
+            step(&mut tracker, &moved, 2 * INTERVAL_SECS, &mut next_id),
+            (1, vec![])
+        );
+    }
+
+    #[test]
     fn tracks_two_vehicles_sharing_a_key() {
-        let mut tracker = Tracker::new(INTERVAL);
+        let mut tracker = Tracker::new(INTERVAL, MIN_MOVE_M);
         let mut next_id = 0;
         let first = [position(1, 51.0, 17.0), position(1, 51.5, 17.5)];
         assert_eq!(step(&mut tracker, &first, 0, &mut next_id), (2, vec![]));
@@ -266,7 +329,7 @@ mod tests {
 
     #[test]
     fn starts_new_row_after_gap() {
-        let mut tracker = Tracker::new(INTERVAL);
+        let mut tracker = Tracker::new(INTERVAL, MIN_MOVE_M);
         let mut next_id = 0;
         let positions = [position(1, 51.0, 17.0)];
         step(&mut tracker, &positions, 0, &mut next_id);
@@ -279,7 +342,7 @@ mod tests {
 
     #[test]
     fn starts_new_row_after_max_span() {
-        let mut tracker = Tracker::new(INTERVAL);
+        let mut tracker = Tracker::new(INTERVAL, MIN_MOVE_M);
         let mut next_id = 0;
         let positions = [position(1, 51.0, 17.0)];
         let span_secs = db::duration_secs(db::MAX_ROW_SPAN);
@@ -301,7 +364,7 @@ mod tests {
 
     #[test]
     fn forgets_vehicles_missing_from_fetch() {
-        let mut tracker = Tracker::new(INTERVAL);
+        let mut tracker = Tracker::new(INTERVAL, MIN_MOVE_M);
         let mut next_id = 0;
         let positions = [position(1, 51.0, 17.0)];
         step(&mut tracker, &positions, 0, &mut next_id);

@@ -23,8 +23,19 @@ pub enum OpenMode {
 
 #[derive(Debug)]
 pub struct StoredPosition {
+    pub line_id: i64,
     pub vehicle_type: VehicleType,
     pub line: String,
+    pub course_id: i64,
+    pub latitude: MicroDegrees,
+    pub longitude: MicroDegrees,
+    pub first_seen_unix: i64,
+    pub last_seen_unix: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathPoint {
+    pub line_id: i64,
     pub course_id: i64,
     pub latitude: MicroDegrees,
     pub longitude: MicroDegrees,
@@ -49,6 +60,13 @@ pub struct CourseVehicle {
     pub brigade: Option<String>,
     pub observed_unix: i64,
     pub distance_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FleetVehicle {
+    pub side_number: i64,
+    pub plate: Option<String>,
+    pub brigade: Option<String>,
 }
 
 pub enum PositionFilter<'a> {
@@ -85,6 +103,7 @@ pub struct BoundingBox {
 
 #[derive(sqlx::FromRow)]
 struct PositionRow {
+    line_id: i64,
     vehicle_type: i64,
     line: String,
     course_id: i64,
@@ -99,6 +118,7 @@ impl TryFrom<PositionRow> for StoredPosition {
 
     fn try_from(row: PositionRow) -> Result<Self> {
         Ok(Self {
+            line_id: row.line_id,
             vehicle_type: row.vehicle_type.try_into()?,
             line: row.line,
             course_id: row.course_id,
@@ -266,7 +286,7 @@ impl Db {
         let max_age_secs = duration_secs(max_age);
         let oldest_first_seen_unix = at_unix - duration_secs(MAX_ROW_SPAN) - max_age_secs;
         let sql = format!(
-            "SELECT l.vehicle_type, l.name AS line, p.course_id, p.latitude_e6, p.longitude_e6, \
+            "SELECT p.line_id, l.vehicle_type, l.name AS line, p.course_id, p.latitude_e6, p.longitude_e6, \
                     p.first_seen_unix, p.last_seen_unix \
              FROM ( \
                  SELECT *, first_seen_unix + seen_for_secs AS last_seen_unix, \
@@ -288,6 +308,55 @@ impl Db {
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(StoredPosition::try_from).collect()
+    }
+
+    pub async fn path_points(
+        &self,
+        courses: &[(i64, i64)],
+        from_unix: i64,
+        to_unix: i64,
+    ) -> Result<Vec<PathPoint>> {
+        let line_ids: Vec<i64> = courses.iter().map(|(line_id, _)| *line_id).collect();
+        let course_ids: Vec<i64> = courses.iter().map(|(_, course_id)| *course_id).collect();
+        let rows: Vec<(i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT line_id, course_id, latitude_e6, longitude_e6, first_seen_unix, \
+                    first_seen_unix + seen_for_secs \
+             FROM vehicle_positions \
+             WHERE line_id IN (SELECT value FROM json_each(?1)) \
+               AND course_id IN (SELECT value FROM json_each(?2)) \
+               AND first_seen_unix BETWEEN ?3 AND ?4 \
+               AND first_seen_unix + seen_for_secs >= ?5 \
+             ORDER BY line_id, course_id, first_seen_unix",
+        )
+        .bind(serde_json::to_string(&line_ids)?)
+        .bind(serde_json::to_string(&course_ids)?)
+        .bind(from_unix - duration_secs(MAX_ROW_SPAN))
+        .bind(to_unix)
+        .bind(from_unix)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    line_id,
+                    course_id,
+                    latitude_e6,
+                    longitude_e6,
+                    first_seen_unix,
+                    last_seen_unix,
+                )| {
+                    PathPoint {
+                        line_id,
+                        course_id,
+                        latitude: MicroDegrees(latitude_e6),
+                        longitude: MicroDegrees(longitude_e6),
+                        first_seen_unix,
+                        last_seen_unix,
+                    }
+                },
+            )
+            .collect())
     }
 
     pub async fn positions_active_at(
@@ -347,20 +416,27 @@ impl Db {
         Ok(inserted)
     }
 
-    pub async fn side_numbers(&self, course_ids: &[i64]) -> Result<HashMap<i64, Vec<i64>>> {
-        let rows: Vec<(i64, i64)> = sqlx::query_as(
-            "SELECT course_id, side_number FROM course_vehicles \
+    pub async fn fleet_vehicles(
+        &self,
+        course_ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<FleetVehicle>>> {
+        let rows: Vec<(i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT course_id, side_number, plate, brigade FROM course_vehicles \
              WHERE course_id IN (SELECT value FROM json_each(?)) \
              ORDER BY course_id, side_number",
         )
         .bind(serde_json::to_string(course_ids)?)
         .fetch_all(&self.pool)
         .await?;
-        let mut side_numbers: HashMap<i64, Vec<i64>> = HashMap::new();
-        for (course_id, side_number) in rows {
-            side_numbers.entry(course_id).or_default().push(side_number);
+        let mut vehicles: HashMap<i64, Vec<FleetVehicle>> = HashMap::new();
+        for (course_id, side_number, plate, brigade) in rows {
+            vehicles.entry(course_id).or_default().push(FleetVehicle {
+                side_number,
+                plate,
+                brigade,
+            });
         }
-        Ok(side_numbers)
+        Ok(vehicles)
     }
 
     pub async fn bounding_box(
@@ -541,14 +617,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stores_side_numbers_per_course() {
+    async fn stores_fleet_vehicles_per_course() {
         let db = open().await;
         let bus = position(VehicleType::Bus, "a", 1);
         db.save_positions(100, &[&bus], &[]).await.unwrap();
         let line = line_id(&db, "a").await;
         let vehicle = |course_id, side_number| course_vehicle(line, course_id, side_number);
+        let with_plate = |course_id, side_number, plate: &str| CourseVehicle {
+            plate: Some(plate.to_owned()),
+            ..vehicle(course_id, side_number)
+        };
         let saved = db
-            .save_course_vehicles(&[vehicle(1, 3109), vehicle(1, 3110), vehicle(2, 8335)])
+            .save_course_vehicles(&[
+                vehicle(1, 3109),
+                vehicle(1, 3110),
+                CourseVehicle {
+                    brigade: Some("12203".to_owned()),
+                    ..with_plate(2, 8335, "DW916KF")
+                },
+            ])
             .await
             .unwrap();
         assert_eq!(saved, 3);
@@ -557,10 +644,24 @@ mod tests {
             0
         );
 
-        let side_numbers = db.side_numbers(&[1, 2, 3]).await.unwrap();
-        assert_eq!(side_numbers.get(&1), Some(&vec![3109, 3110]));
-        assert_eq!(side_numbers.get(&2), Some(&vec![8335]));
-        assert_eq!(side_numbers.get(&3), None);
+        let fleet = |side_number, plate: Option<&str>| FleetVehicle {
+            side_number,
+            plate: plate.map(str::to_owned),
+            brigade: None,
+        };
+        let vehicles = db.fleet_vehicles(&[1, 2, 3]).await.unwrap();
+        assert_eq!(
+            vehicles.get(&1),
+            Some(&vec![fleet(3109, None), fleet(3110, None)])
+        );
+        assert_eq!(
+            vehicles.get(&2),
+            Some(&vec![FleetVehicle {
+                brigade: Some("12203".to_owned()),
+                ..fleet(8335, Some("DW916KF"))
+            }])
+        );
+        assert_eq!(vehicles.get(&3), None);
     }
 
     #[tokio::test]

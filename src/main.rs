@@ -7,6 +7,7 @@ mod mpk;
 mod open_data;
 mod open_meteo;
 mod query;
+mod speed;
 mod weather;
 
 use std::path::PathBuf;
@@ -120,6 +121,18 @@ struct VehicleArgs {
 
     #[arg(long, env = "MPK_LINES_REFRESH_SECS", default_value_t = 3600)]
     lines_refresh_secs: u64,
+
+    /// Moves of at most this many meters from where a vehicle's current row started are treated as GPS jitter; 0 stores every change
+    #[arg(long, env = "MPK_MIN_MOVE_METERS", default_value_t = 2.0, value_parser = parse_meters)]
+    min_move_meters: f64,
+}
+
+fn parse_meters(input: &str) -> Result<f64, String> {
+    let meters: f64 = input.parse().map_err(|e| format!("{e}"))?;
+    if !meters.is_finite() || meters < 0.0 {
+        return Err("must be a non-negative number of meters".to_owned());
+    }
+    Ok(meters)
 }
 
 #[derive(clap::Args)]
@@ -226,6 +239,7 @@ async fn collect(
         db.clone(),
         vehicle_interval,
         Duration::from_secs(vehicle_args.lines_refresh_secs),
+        vehicle_args.min_move_meters,
     );
     let vehicles_loop = run_every("vehicle", vehicle_interval, stop_rx.clone(), async || {
         vehicles.collect().await
