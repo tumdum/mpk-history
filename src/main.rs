@@ -1,8 +1,10 @@
 mod backup;
 mod collector;
 mod db;
+mod fleet;
 mod geo;
 mod mpk;
+mod open_data;
 mod open_meteo;
 mod query;
 mod weather;
@@ -10,7 +12,7 @@ mod weather;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use jiff::Timestamp;
 use tokio::signal::unix::{SignalKind, signal};
@@ -21,6 +23,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::collector::VehicleCollector;
 use crate::db::{Db, OpenMode};
+use crate::fleet::FleetCollector;
 use crate::open_meteo::Area;
 use crate::weather::WeatherCollector;
 
@@ -52,11 +55,14 @@ enum Command {
 
         #[command(flatten)]
         weather: WeatherArgs,
+
+        #[command(flatten)]
+        fleet: FleetArgs,
     },
-    /// Show positions of all vehicles of a line at a given time
+    /// Show positions of all vehicles of a line, or of one vehicle by plate, at a given time
     Query {
-        #[arg(long)]
-        line: String,
+        #[command(flatten)]
+        target: QueryTarget,
 
         /// Local time like "2026-09-25 12:40:00" or RFC 3339 like "2026-09-25T10:40:00Z"; defaults to now
         #[arg(long, value_parser = query::parse_time)]
@@ -84,6 +90,30 @@ enum Command {
 }
 
 #[derive(clap::Args)]
+#[group(required = true, multiple = false)]
+struct QueryTarget {
+    /// Line name, e.g. 18 or A
+    #[arg(long)]
+    line: Option<String>,
+
+    /// Plate number, e.g. DW916KF; only courses already matched to fleet data can be found
+    #[arg(long)]
+    plate: Option<String>,
+}
+
+impl TryFrom<QueryTarget> for query::Target {
+    type Error = anyhow::Error;
+
+    fn try_from(target: QueryTarget) -> Result<Self> {
+        match (target.line, target.plate) {
+            (Some(line), None) => Ok(query::Target::Line(line)),
+            (None, Some(plate)) => Ok(query::Target::Plate(plate)),
+            _ => bail!("pass exactly one of --line or --plate"),
+        }
+    }
+}
+
+#[derive(clap::Args)]
 struct VehicleArgs {
     #[arg(long, env = "MPK_INTERVAL_SECS", default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
     interval_secs: u64,
@@ -95,8 +125,8 @@ struct VehicleArgs {
 #[derive(clap::Args)]
 struct WeatherArgs {
     /// Whether to also collect weather from open-meteo
-    #[arg(long, env = "MPK_WEATHER", value_enum, default_value_t = WeatherMode::Enabled)]
-    weather: WeatherMode,
+    #[arg(long, env = "MPK_WEATHER", value_enum, default_value_t = CollectorMode::Enabled)]
+    weather: CollectorMode,
 
     /// open-meteo counts every grid point as an API call; the free tier allows 10000 calls per day
     #[arg(long, env = "MPK_WEATHER_INTERVAL_SECS", default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..))]
@@ -111,8 +141,19 @@ struct WeatherArgs {
     weather_model: String,
 }
 
+#[derive(clap::Args)]
+struct FleetArgs {
+    /// Whether to match courses to side and plate numbers from Wrocław open data
+    #[arg(long, env = "MPK_FLEET", value_enum, default_value_t = CollectorMode::Enabled)]
+    fleet: CollectorMode,
+
+    /// The open data vehicle list is refreshed about every 15 minutes
+    #[arg(long, env = "MPK_FLEET_INTERVAL_SECS", default_value_t = 900, value_parser = clap::value_parser!(u64).range(1..))]
+    fleet_interval_secs: u64,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
-enum WeatherMode {
+enum CollectorMode {
     Enabled,
     Disabled,
 }
@@ -128,22 +169,27 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     match args.command {
-        Command::Collect { vehicles, weather } => {
+        Command::Collect {
+            vehicles,
+            weather,
+            fleet,
+        } => {
             let db = Db::open(&args.database, OpenMode::CreateIfMissing).await?;
             info!(database = %args.database.display(), "database ready");
-            let result = collect(&db, vehicles, weather).await;
+            let result = collect(&db, vehicles, weather, fleet).await;
             db.close().await;
             result
         }
         Command::Query {
-            line,
+            target,
             at,
             max_age_secs,
         } => {
+            let target = query::Target::try_from(target)?;
             let db = Db::open(&args.database, OpenMode::MustExist).await?;
             let at = at.unwrap_or_else(Timestamp::now);
             let result =
-                query::print_positions(&db, &line, at, Duration::from_secs(max_age_secs)).await;
+                query::print_positions(&db, &target, at, Duration::from_secs(max_age_secs)).await;
             db.close().await;
             result
         }
@@ -162,7 +208,12 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn collect(db: &Db, vehicle_args: VehicleArgs, weather_args: WeatherArgs) -> Result<()> {
+async fn collect(
+    db: &Db,
+    vehicle_args: VehicleArgs,
+    weather_args: WeatherArgs,
+    fleet_args: FleetArgs,
+) -> Result<()> {
     let http = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(REQUEST_TIMEOUT)
@@ -181,7 +232,7 @@ async fn collect(db: &Db, vehicle_args: VehicleArgs, weather_args: WeatherArgs) 
     });
 
     let weather_loop = async {
-        if let WeatherMode::Disabled = weather_args.weather {
+        if let CollectorMode::Disabled = weather_args.weather {
             return;
         }
         info!(area = %weather_args.weather_area, model = weather_args.weather_model, "collecting weather");
@@ -200,6 +251,22 @@ async fn collect(db: &Db, vehicle_args: VehicleArgs, weather_args: WeatherArgs) 
         .await;
     };
 
+    let fleet_loop = async {
+        if let CollectorMode::Disabled = fleet_args.fleet {
+            return Ok(());
+        }
+        info!("matching courses to fleet open data");
+        let mut fleet = FleetCollector::new(open_data::Client::new(http.clone())?, db.clone());
+        run_every(
+            "fleet",
+            Duration::from_secs(fleet_args.fleet_interval_secs),
+            stop_rx.clone(),
+            async || fleet.collect().await,
+        )
+        .await;
+        Ok(())
+    };
+
     let shutdown = async {
         let result = shutdown_signal().await;
         info!("shutting down");
@@ -207,8 +274,9 @@ async fn collect(db: &Db, vehicle_args: VehicleArgs, weather_args: WeatherArgs) 
         result
     };
 
-    let (result, (), ()) = tokio::join!(shutdown, vehicles_loop, weather_loop);
-    result
+    let (result, (), (), fleet_result) =
+        tokio::join!(shutdown, vehicles_loop, weather_loop, fleet_loop);
+    result.and(fleet_result)
 }
 
 async fn run_every(

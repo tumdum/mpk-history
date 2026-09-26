@@ -32,6 +32,48 @@ pub struct StoredPosition {
     pub last_seen_unix: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActivePosition {
+    pub line_id: i64,
+    pub course_id: i64,
+    pub latitude: MicroDegrees,
+    pub longitude: MicroDegrees,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CourseVehicle {
+    pub line_id: i64,
+    pub course_id: i64,
+    pub side_number: i64,
+    pub plate: Option<String>,
+    pub brigade: Option<String>,
+    pub observed_unix: i64,
+    pub distance_m: f64,
+}
+
+pub enum PositionFilter<'a> {
+    Line(&'a str),
+    Plate(&'a str),
+}
+
+impl PositionFilter<'_> {
+    fn condition(&self) -> &'static str {
+        match self {
+            PositionFilter::Line(_) => "line_id IN (SELECT id FROM lines WHERE name = ?1)",
+            PositionFilter::Plate(_) => {
+                "line_id IN (SELECT line_id FROM course_vehicles WHERE plate = ?1) \
+                 AND course_id IN (SELECT course_id FROM course_vehicles WHERE plate = ?1)"
+            }
+        }
+    }
+
+    fn value(&self) -> &str {
+        match self {
+            PositionFilter::Line(value) | PositionFilter::Plate(value) => value,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct BoundingBox {
     pub positions: i64,
@@ -217,33 +259,108 @@ impl Db {
 
     pub async fn positions_at(
         &self,
-        line: &str,
+        filter: PositionFilter<'_>,
         at_unix: i64,
         max_age: Duration,
     ) -> Result<Vec<StoredPosition>> {
         let max_age_secs = duration_secs(max_age);
         let oldest_first_seen_unix = at_unix - duration_secs(MAX_ROW_SPAN) - max_age_secs;
-        let rows: Vec<PositionRow> = sqlx::query_as(
+        let sql = format!(
             "SELECT l.vehicle_type, l.name AS line, p.course_id, p.latitude_e6, p.longitude_e6, \
                     p.first_seen_unix, p.last_seen_unix \
              FROM ( \
                  SELECT *, first_seen_unix + seen_for_secs AS last_seen_unix, \
                         MAX(first_seen_unix) OVER (PARTITION BY line_id, course_id) AS latest_first_seen_unix \
                  FROM vehicle_positions \
-                 WHERE line_id IN (SELECT id FROM lines WHERE name = ?1) \
+                 WHERE {} \
                    AND first_seen_unix BETWEEN ?2 AND ?3 \
              ) p \
              JOIN lines l ON l.id = p.line_id \
              WHERE p.last_seen_unix >= p.latest_first_seen_unix AND p.last_seen_unix >= ?4 \
              ORDER BY l.vehicle_type, p.course_id",
+            filter.condition()
+        );
+        let rows: Vec<PositionRow> = sqlx::query_as(&sql)
+            .bind(filter.value())
+            .bind(oldest_first_seen_unix)
+            .bind(at_unix)
+            .bind(at_unix - max_age_secs)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(StoredPosition::try_from).collect()
+    }
+
+    pub async fn positions_active_at(
+        &self,
+        line: &str,
+        at_unix: i64,
+        slack: Duration,
+    ) -> Result<Vec<ActivePosition>> {
+        let slack_secs = duration_secs(slack);
+        let rows: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT line_id, course_id, latitude_e6, longitude_e6 \
+             FROM vehicle_positions \
+             WHERE line_id IN (SELECT id FROM lines WHERE name = ?1) \
+               AND first_seen_unix BETWEEN ?2 AND ?3 \
+               AND first_seen_unix + seen_for_secs >= ?4",
         )
         .bind(line)
-        .bind(oldest_first_seen_unix)
-        .bind(at_unix)
-        .bind(at_unix - max_age_secs)
+        .bind(at_unix - duration_secs(MAX_ROW_SPAN) - slack_secs)
+        .bind(at_unix + slack_secs)
+        .bind(at_unix - slack_secs)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(StoredPosition::try_from).collect()
+        Ok(rows
+            .into_iter()
+            .map(
+                |(line_id, course_id, latitude_e6, longitude_e6)| ActivePosition {
+                    line_id,
+                    course_id,
+                    latitude: MicroDegrees(latitude_e6),
+                    longitude: MicroDegrees(longitude_e6),
+                },
+            )
+            .collect())
+    }
+
+    pub async fn save_course_vehicles(&self, vehicles: &[CourseVehicle]) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let mut inserted = 0;
+        for vehicle in vehicles {
+            inserted += sqlx::query(
+                "INSERT OR IGNORE INTO course_vehicles \
+                 (line_id, course_id, side_number, plate, brigade, observed_unix, distance_m) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(vehicle.line_id)
+            .bind(vehicle.course_id)
+            .bind(vehicle.side_number)
+            .bind(&vehicle.plate)
+            .bind(&vehicle.brigade)
+            .bind(vehicle.observed_unix)
+            .bind(vehicle.distance_m)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    pub async fn side_numbers(&self, course_ids: &[i64]) -> Result<HashMap<i64, Vec<i64>>> {
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT course_id, side_number FROM course_vehicles \
+             WHERE course_id IN (SELECT value FROM json_each(?)) \
+             ORDER BY course_id, side_number",
+        )
+        .bind(serde_json::to_string(course_ids)?)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut side_numbers: HashMap<i64, Vec<i64>> = HashMap::new();
+        for (course_id, side_number) in rows {
+            side_numbers.entry(course_id).or_default().push(side_number);
+        }
+        Ok(side_numbers)
     }
 
     pub async fn bounding_box(
@@ -323,6 +440,27 @@ mod tests {
             .unwrap()
     }
 
+    async fn line_id(db: &Db, name: &str) -> i64 {
+        let (id,): (i64,) = sqlx::query_as("SELECT id FROM lines WHERE name = ?")
+            .bind(name)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    fn course_vehicle(line_id: i64, course_id: i64, side_number: i64) -> CourseVehicle {
+        CourseVehicle {
+            line_id,
+            course_id,
+            side_number,
+            plate: None,
+            brigade: None,
+            observed_unix: 100,
+            distance_m: 0.0,
+        }
+    }
+
     async fn line_count(db: &Db) -> i64 {
         let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM lines")
             .fetch_one(&db.pool)
@@ -358,7 +496,10 @@ mod tests {
             .await
             .unwrap();
 
-        let buses = db.positions_at("a", 105, MAX_AGE).await.unwrap();
+        let buses = db
+            .positions_at(PositionFilter::Line("a"), 105, MAX_AGE)
+            .await
+            .unwrap();
         assert_eq!(
             summary(&buses),
             [
@@ -366,9 +507,95 @@ mod tests {
                 (VehicleType::Bus, "a", 3, 105, 105),
             ]
         );
-        let trams = db.positions_at("1", 105, MAX_AGE).await.unwrap();
+        let trams = db
+            .positions_at(PositionFilter::Line("1"), 105, MAX_AGE)
+            .await
+            .unwrap();
         assert_eq!(summary(&trams), [(VehicleType::Tram, "1", 2, 100, 100)]);
         assert_eq!(line_count(&db).await, 2);
+    }
+
+    #[tokio::test]
+    async fn finds_positions_active_at_a_time() {
+        let db = open().await;
+        let bus = position(VehicleType::Bus, "a", 1);
+        let ids = db.save_positions(100, &[&bus], &[]).await.unwrap();
+        db.save_positions(160, &[], &ids).await.unwrap();
+        let slack = Duration::from_secs(30);
+
+        let at = |t| {
+            let db = db.clone();
+            async move { db.positions_active_at("a", t, slack).await.unwrap() }
+        };
+        let expected = ActivePosition {
+            line_id: line_id(&db, "a").await,
+            course_id: 1,
+            latitude: bus.latitude,
+            longitude: bus.longitude,
+        };
+        assert_eq!(at(130).await, [expected]);
+        assert_eq!(at(71).await, [expected]);
+        assert_eq!(at(189).await, [expected]);
+        assert!(at(69).await.is_empty());
+        assert!(at(191).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stores_side_numbers_per_course() {
+        let db = open().await;
+        let bus = position(VehicleType::Bus, "a", 1);
+        db.save_positions(100, &[&bus], &[]).await.unwrap();
+        let line = line_id(&db, "a").await;
+        let vehicle = |course_id, side_number| course_vehicle(line, course_id, side_number);
+        let saved = db
+            .save_course_vehicles(&[vehicle(1, 3109), vehicle(1, 3110), vehicle(2, 8335)])
+            .await
+            .unwrap();
+        assert_eq!(saved, 3);
+        assert_eq!(
+            db.save_course_vehicles(&[vehicle(1, 3109)]).await.unwrap(),
+            0
+        );
+
+        let side_numbers = db.side_numbers(&[1, 2, 3]).await.unwrap();
+        assert_eq!(side_numbers.get(&1), Some(&vec![3109, 3110]));
+        assert_eq!(side_numbers.get(&2), Some(&vec![8335]));
+        assert_eq!(side_numbers.get(&3), None);
+    }
+
+    #[tokio::test]
+    async fn finds_vehicle_by_plate() {
+        let db = open().await;
+        let first = position(VehicleType::Bus, "a", 1);
+        let second = position(VehicleType::Bus, "a", 2);
+        let tram = position(VehicleType::Tram, "1", 3);
+        db.save_positions(100, &[&first, &second, &tram], &[])
+            .await
+            .unwrap();
+        let with_plate = |line_id, course_id, side_number, plate: &str| CourseVehicle {
+            plate: Some(plate.to_owned()),
+            ..course_vehicle(line_id, course_id, side_number)
+        };
+        let bus_line = line_id(&db, "a").await;
+        let tram_line = line_id(&db, "1").await;
+        db.save_course_vehicles(&[
+            with_plate(bus_line, 1, 8335, "DW916KF"),
+            course_vehicle(bus_line, 2, 8336),
+            with_plate(tram_line, 3, 3109, "DW111AA"),
+        ])
+        .await
+        .unwrap();
+
+        let found = db
+            .positions_at(PositionFilter::Plate("DW916KF"), 100, MAX_AGE)
+            .await
+            .unwrap();
+        assert_eq!(summary(&found), [(VehicleType::Bus, "a", 1, 100, 100)]);
+        let unknown = db
+            .positions_at(PositionFilter::Plate("DW000XX"), 100, MAX_AGE)
+            .await
+            .unwrap();
+        assert!(unknown.is_empty());
     }
 
     #[tokio::test]
@@ -378,7 +605,10 @@ mod tests {
         let train = position(VehicleType::Train, "x", 2);
         db.save_positions(100, &[&bus, &train], &[]).await.unwrap();
 
-        let positions = db.positions_at("x", 100, MAX_AGE).await.unwrap();
+        let positions = db
+            .positions_at(PositionFilter::Line("x"), 100, MAX_AGE)
+            .await
+            .unwrap();
         assert_eq!(
             summary(&positions),
             [

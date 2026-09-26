@@ -1,13 +1,17 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, civil};
 
-use crate::db::{BoundingBox, Db, StoredPosition};
+use crate::db::{BoundingBox, Db, PositionFilter, StoredPosition};
+use crate::open_data;
 
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 const KM_PER_DEGREE_LATITUDE: f64 = 111.32;
+const UNKNOWN_SIDE_NUMBER: &str = "-";
+const SIDE_NUMBER_SEPARATOR: &str = "/";
 
 pub fn parse_time(input: &str) -> Result<Timestamp> {
     if let Ok(timestamp) = input.parse::<Timestamp>() {
@@ -19,34 +23,55 @@ pub fn parse_time(input: &str) -> Result<Timestamp> {
     Ok(local.to_zoned(TimeZone::system())?.timestamp())
 }
 
-pub async fn print_positions(db: &Db, line: &str, at: Timestamp, max_age: Duration) -> Result<()> {
-    let line = line.to_lowercase();
-    let positions = db.positions_at(&line, at.as_second(), max_age).await?;
+pub enum Target {
+    Line(String),
+    Plate(String),
+}
+
+pub async fn print_positions(
+    db: &Db,
+    target: &Target,
+    at: Timestamp,
+    max_age: Duration,
+) -> Result<()> {
+    let value = match target {
+        Target::Line(line) => line.to_lowercase(),
+        Target::Plate(plate) => open_data::normalize_plate(plate),
+    };
+    let (filter, kind) = match target {
+        Target::Line(_) => (PositionFilter::Line(&value), "line"),
+        Target::Plate(_) => (PositionFilter::Plate(&value), "plate"),
+    };
+    let description = format!("{kind} {value}");
+    let positions = db.positions_at(filter, at.as_second(), max_age).await?;
     let at_local = format_time(at.as_second())?;
     if positions.is_empty() {
-        println!("no vehicles of line {line} at {at_local}");
+        println!("no vehicles for {description} at {at_local}");
         return Ok(());
     }
     println!(
-        "{} vehicle(s) of line {line} at {at_local}",
+        "{} vehicle(s) for {description} at {at_local}",
         positions.len()
     );
+    let course_ids: Vec<i64> = positions.iter().map(|p| p.course_id).collect();
+    let side_numbers = db.side_numbers(&course_ids).await?;
     println!(
-        "{:<5} {:<5} {:>10} {:>10} {:>10}  {:<19}  {:<19}",
-        "TYPE", "LINE", "COURSE", "LATITUDE", "LONGITUDE", "HERE SINCE", "LAST SEEN"
+        "{:<5} {:<5} {:>10} {:>9} {:>10} {:>10}  {:<19}  {:<19}",
+        "TYPE", "LINE", "COURSE", "SIDE", "LATITUDE", "LONGITUDE", "HERE SINCE", "LAST SEEN"
     );
     for position in positions {
-        print_position(&position)?;
+        print_position(&position, &side_numbers)?;
     }
     Ok(())
 }
 
-fn print_position(position: &StoredPosition) -> Result<()> {
+fn print_position(position: &StoredPosition, side_numbers: &HashMap<i64, Vec<i64>>) -> Result<()> {
     println!(
-        "{:<5} {:<5} {:>10} {:>10.6} {:>10.6}  {:<19}  {:<19}",
+        "{:<5} {:<5} {:>10} {:>9} {:>10.6} {:>10.6}  {:<19}  {:<19}",
         position.vehicle_type.as_str(),
         position.line,
         position.course_id,
+        format_side_numbers(side_numbers.get(&position.course_id)),
         position.latitude.degrees(),
         position.longitude.degrees(),
         format_time(position.first_seen_unix)?,
@@ -111,6 +136,17 @@ fn width_km(bbox: &BoundingBox) -> f64 {
     (bbox.east.degrees() - bbox.west.degrees())
         * KM_PER_DEGREE_LATITUDE
         * middle_latitude.to_radians().cos()
+}
+
+fn format_side_numbers(side_numbers: Option<&Vec<i64>>) -> String {
+    let Some(side_numbers) = side_numbers else {
+        return UNKNOWN_SIDE_NUMBER.to_owned();
+    };
+    side_numbers
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(SIDE_NUMBER_SEPARATOR)
 }
 
 fn format_time(unix: i64) -> Result<String> {
