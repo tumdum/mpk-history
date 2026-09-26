@@ -1,0 +1,21 @@
+CREATE TABLE weather_observations (
+    id INTEGER PRIMARY KEY,
+    model TEXT NOT NULL,
+    latitude_e6 INTEGER NOT NULL,
+    longitude_e6 INTEGER NOT NULL,
+    observed_unix INTEGER NOT NULL,
+    fetched_unix INTEGER NOT NULL,
+    temperature_2m REAL,
+    relative_humidity_2m REAL,
+    precipitation REAL,
+    rain REAL,
+    showers REAL,
+    snowfall REAL,
+    weather_code INTEGER,
+    cloud_cover REAL,
+    surface_pressure REAL,
+    wind_speed_10m REAL,
+    wind_direction_10m REAL,
+    wind_gusts_10m REAL,
+    UNIQUE (model, observed_unix, latitude_e6, longitude_e6)
+);
