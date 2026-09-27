@@ -181,7 +181,7 @@ A plain `GET` of the JSON download (about 300 KB):
 | `Nr_Rej` | Plate number | `null`, `"-"` and `""` mean no plate. Stored uppercase without spaces |
 | `Brygada` | Brigade (duty) code | For example `12207` = line 122, brigade 07. Letter lines look like `D02` |
 | `Nazwa_Linii` | Line name | `null` or `""` means not on a route, and the record is not used. Lowercased |
-| `Data_Aktualizacji` | Time of the position | **Warsaw local time**, converted to UTC |
+| `Data_Aktualizacji` | Time of the position | **Warsaw local time**, converted to UTC. See [Daylight saving time](#daylight-saving-time) |
 | `Ostatnia_Pozycja_Szerokosc` | Latitude | Records at `0, 0` or out of range are not used |
 | `Ostatnia_Pozycja_Dlugosc` | Longitude | |
 
@@ -223,9 +223,9 @@ courses `29114019`, `29114020` and `29114021`, all with bus 5413.
 
 ### Fleet record → course (direct match)
 
-For each fleet record whose `Data_Aktualizacji` changed since the previous download
-(`src/fleet.rs`). The collector remembers these times in memory, so after a restart
-every record is checked once more:
+For each fleet record whose `Data_Aktualizacji` differs from the one in the previous
+download (`src/fleet.rs`). The collector remembers these times in memory, so after a
+restart every record is checked once more:
 
 1. Load all stored positions of the record's line that were active within **30 s** of
    the record's time.
@@ -237,6 +237,14 @@ every record is checked once more:
    record is counted as `ambiguous`. If none is, it is counted as `unmatched`. In both
    cases nothing is stored, and the record is not tried again until its
    `Data_Aktualizacji` changes in a later download.
+
+If the record's local time has two possible UTC times (see
+[Daylight saving time](#daylight-saving-time)), steps 1–4 run for each of them:
+
+- If exactly one of them gives a match, that one is used, and its time is stored.
+- If both match the same course, the earlier time is used.
+- If they match different courses, or either is ambiguous, the record counts as
+  `ambiguous` and nothing is stored.
 
 This works because both sources carry the same GPS fix: most matches are closer than
 1 m. In one test download, 211 of 324 fresh records matched, 8 were ambiguous, and no
@@ -299,7 +307,28 @@ All stored times are UTC Unix seconds:
 |---|---|
 | MPK positions | Time of our fetch |
 | Open-Meteo | `current.time` from the response, requested as `unixtime` |
-| Open data fleet | `Data_Aktualizacji`, converted from `Europe/Warsaw` to UTC |
+| Open data fleet | `Data_Aktualizacji`, converted from `Europe/Warsaw` to UTC; one or two possible times, see below |
+
+### Daylight saving time
+
+`Data_Aktualizacji` is local time without a UTC offset. Twice a year one local time
+doesn't map to exactly one UTC time:
+
+- **Last Sunday of October:** clocks go back from 03:00 to 02:00, so 02:00–03:00
+  happens twice. `02:30` is either 00:30 UTC (summer time) or 01:30 UTC (winter time).
+- **Last Sunday of March:** clocks jump from 02:00 to 03:00, so 02:00–03:00 doesn't
+  exist. If such a time ever appears, both nearby UTC times are tried.
+
+`src/open_data.rs` gets both possible UTC times from jiff
+(`TimeZone::to_ambiguous_timestamp`), and the matcher lets the stored positions decide
+which is right, as described in
+[Fleet record → course](#fleet-record--course-direct-match). A wrong time means
+comparing with positions from an hour away, so it almost never matches. The log field
+`ambiguous_local_time` counts the records that had two possible times.
+
+For the same reason, the collector reprocesses a record when its `Data_Aktualizacji`
+is *different* from the previous download, not only when it is newer: during the
+repeated hour local time goes backwards.
 
 The CLI reads and prints local time. `--at`, `--from` and `--to` also accept RFC 3339
 times such as `2026-09-25T10:40:00Z`.
