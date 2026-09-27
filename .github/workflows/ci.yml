@@ -49,10 +49,20 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --locked --release
+      - name: Split debug symbols
+        working-directory: target/release
+        run: |
+          objcopy --only-keep-debug mpk-history mpk-history.debug
+          objcopy --strip-debug --add-gnu-debuglink=mpk-history.debug mpk-history
       - uses: actions/upload-artifact@v7
         with:
           name: mpk-history-x86_64-linux
           path: target/release/mpk-history
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mpk-history-x86_64-linux-debug
+          path: target/release/mpk-history.debug
           if-no-files-found: error
 
   coverage:

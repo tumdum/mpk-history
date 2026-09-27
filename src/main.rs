@@ -1,4 +1,5 @@
 mod backup;
+mod build_info;
 mod collector;
 mod db;
 mod fleet;
@@ -31,7 +32,6 @@ use crate::open_meteo::Area;
 use crate::weather::WeatherCollector;
 
 const DEFAULT_LOG_FILTER: &str = "info";
-const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
@@ -205,6 +205,12 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER)),
         )
         .init();
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        commit = build_info::commit(),
+        dirty = build_info::dirty(),
+        "starting"
+    );
 
     let args = Args::parse();
     match args.command {
@@ -254,7 +260,7 @@ async fn collect(
     fleet_args: FleetArgs,
 ) -> Result<()> {
     let http = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
+        .user_agent(build_info::user_agent())
         .timeout(REQUEST_TIMEOUT)
         .build()?;
     let (stop_tx, stop_rx) = watch::channel(());
