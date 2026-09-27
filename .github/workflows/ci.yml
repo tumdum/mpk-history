@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  COVERAGE_DIR: coverage
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --locked
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install --profile minimal
+      - run: rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  release:
+    name: Release build
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --locked --release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mpk-history-x86_64-linux
+          path: target/release/mpk-history
+          if-no-files-found: error
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-26.04
+    outputs:
+      lines: ${{ steps.summary.outputs.lines }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install --profile minimal
+      - run: rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo install --locked cargo-llvm-cov@0.9.1
+      - name: Compute coverage
+        run: cargo llvm-cov --locked --html --output-dir ${{ env.COVERAGE_DIR }}
+      - name: Print coverage summary
+        id: summary
+        run: |
+          cargo llvm-cov --locked --no-run | tee "$RUNNER_TEMP/summary.txt"
+          {
+            echo '## Coverage'
+            echo '```'
+            cat "$RUNNER_TEMP/summary.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          awk '$1 == "TOTAL" { print "::notice title=Coverage::lines " $10 ", regions " $4 ", functions " $7 }' "$RUNNER_TEMP/summary.txt"
+          awk '$1 == "TOTAL" { print "lines=" $10 }' "$RUNNER_TEMP/summary.txt" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-html
+          path: ${{ env.COVERAGE_DIR }}/html
+          if-no-files-found: error
+
+  coverage-total:
+    name: total coverage ${{ needs.coverage.outputs.lines }}
+    needs: coverage
+    runs-on: ubuntu-26.04
+    steps:
+      - run: echo "${{ needs.coverage.outputs.lines }}"
