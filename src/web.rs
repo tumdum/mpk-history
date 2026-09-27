@@ -19,17 +19,20 @@ use tracing::{error, info, warn};
 use crate::charts::{self, LineChart, Point, RGBColor, Rendered, Series, TickStep};
 use crate::db::{self, Db};
 use crate::mpk::VehicleType;
-use crate::stats::{self, Bucket, Kind, Retention, StatsCache, TimedBucket, Totals};
+use crate::stats::{self, Detail, Group, Kind, Retention, StatsCache, TimedTotals, Totals};
 
 mod period;
 mod quality;
+mod selection;
 
 use period::{Period, PeriodKind};
-use quality::{OVERVIEW_QUALITY_PATH, quality_path};
+use quality::{OVERVIEW_QUALITY_PATH, QUALITY_SEGMENT};
+use selection::{Page, Selection, SelectionKey, Subject};
 
 const TITLE: &str = "MPK Wrocław statistics";
 const OVERVIEW_PATH: &str = "/";
 const OVERVIEW_LABEL: &str = "Overview";
+const CHARTS_PATH: &str = "/charts/{file}";
 const SVG_EXTENSION: &str = ".svg";
 const SVG_CONTENT_TYPE: &str = "image/svg+xml";
 const MISSING_VALUE: &str = "–";
@@ -60,6 +63,7 @@ body {
 }
 h1 { font-size: 1.5rem; margin: 0 0 4px; }
 h2 { font-size: 1.2rem; margin: 24px 0 12px; }
+h3 { font-size: 1rem; margin: 16px 0 8px; }
 #updated { color: var(--text-secondary); margin: 0; }
 .table-wrap { overflow-x: auto; margin-bottom: 16px; }
 .stats { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
@@ -116,6 +120,9 @@ const BLUE: RGBColor = RGBColor(0x2a, 0x78, 0xd6);
 const ORANGE: RGBColor = RGBColor(0xeb, 0x68, 0x34);
 const AQUA: RGBColor = RGBColor(0x1b, 0xaf, 0x7a);
 const YELLOW: RGBColor = RGBColor(0xed, 0xa1, 0x00);
+const MAGENTA: RGBColor = RGBColor(0xe8, 0x7b, 0xa4);
+const GREEN: RGBColor = RGBColor(0x00, 0x83, 0x00);
+const VIOLET: RGBColor = RGBColor(0x4a, 0x3a, 0xa7);
 
 #[derive(Debug, Clone, Copy)]
 pub enum Clock {
@@ -364,21 +371,79 @@ fn kind_color(kind: Kind) -> RGBColor {
         Kind::All => BLUE,
         Kind::Vehicle(VehicleType::Bus) => ORANGE,
         Kind::Vehicle(VehicleType::Tram) => AQUA,
-        Kind::Vehicle(VehicleType::Train) => YELLOW,
+        Kind::Vehicle(VehicleType::Train) => VIOLET,
     }
 }
 
-fn visible_kinds(total: &Bucket) -> Vec<Kind> {
-    Kind::ALL
-        .into_iter()
-        .filter(|kind| matches!(kind, Kind::All) || total.get(*kind).has_vehicles())
-        .collect()
+const LINE_MINUTES_RANGE: Range = Range::Day;
+const HOUR_STEP: ChartStep = ChartStep::Hours(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecentSource {
+    Minutes,
+    LineMinutes,
+    Quarters,
+}
+
+impl RecentSource {
+    fn of(groups: &[Group], range: Range) -> Self {
+        if !groups.iter().any(|group| matches!(group, Group::Line(_))) {
+            return RecentSource::Minutes;
+        }
+        if range.duration() <= LINE_MINUTES_RANGE.duration() {
+            RecentSource::LineMinutes
+        } else {
+            RecentSource::Quarters
+        }
+    }
+
+    fn resolution(self) -> Duration {
+        match self {
+            RecentSource::Minutes | RecentSource::LineMinutes => stats::BUCKET,
+            RecentSource::Quarters => HISTORY_RESOLUTION,
+        }
+    }
+
+    fn window(self, range: Range, now_unix: i64) -> (i64, i64) {
+        let (from_unix, to_unix) = range.window(now_unix);
+        let resolution_secs = db::duration_secs(self.resolution());
+        (stats::align_down(from_unix, resolution_secs), to_unix)
+    }
+}
+
+struct RangeTotals {
+    window: (i64, i64),
+    series: Vec<Vec<TimedTotals>>,
+}
+
+impl RangeTotals {
+    fn since(&self, from_unix: i64) -> RangeTotals {
+        RangeTotals {
+            window: (from_unix, self.window.1),
+            series: self
+                .series
+                .iter()
+                .map(|series| {
+                    series
+                        .iter()
+                        .filter(|timed| timed.start_unix >= from_unix)
+                        .copied()
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+}
+
+fn has_vehicles(series: &[TimedTotals]) -> bool {
+    stats::sum(series).has_vehicles()
 }
 
 #[derive(Clone)]
 struct AppState {
     db: Db,
     recent: Arc<StatsCache>,
+    recent_lines: Arc<StatsCache>,
     history: Arc<StatsCache>,
     clock: Clock,
     tz: TimeZone,
@@ -391,8 +456,18 @@ impl AppState {
             recent: Arc::new(StatsCache::new(
                 stats::BUCKET,
                 Retention::Last(Range::LONGEST.duration()),
+                Detail::Kinds,
             )),
-            history: Arc::new(StatsCache::new(HISTORY_RESOLUTION, Retention::Forever)),
+            recent_lines: Arc::new(StatsCache::new(
+                stats::BUCKET,
+                Retention::Last(LINE_MINUTES_RANGE.duration()),
+                Detail::Lines,
+            )),
+            history: Arc::new(StatsCache::new(
+                HISTORY_RESOLUTION,
+                Retention::Forever,
+                Detail::Lines,
+            )),
             clock,
             tz: TimeZone::system(),
         }
@@ -401,15 +476,25 @@ impl AppState {
     async fn warm_up(self) {
         let started = Instant::now();
         let now_unix = self.clock.now().as_second();
-        if let Err(e) = self.recent_buckets(Range::LONGEST, now_unix).await {
-            warn!("failed to compute recent statistics: {e:#}");
-            return;
+        let recent = [
+            (&self.recent, Range::LONGEST),
+            (&self.recent_lines, LINE_MINUTES_RANGE),
+        ];
+        for (cache, range) in recent {
+            let (from_unix, to_unix) = range.window(now_unix);
+            if let Err(e) = cache
+                .totals(&self.db, from_unix, to_unix, now_unix, &[])
+                .await
+            {
+                warn!("failed to compute recent statistics: {e:#}");
+                return;
+            }
         }
         info!(
             elapsed_secs = started.elapsed().as_secs_f64(),
             "recent statistics ready"
         );
-        match self.history_buckets(i64::MIN, now_unix, now_unix).await {
+        match self.history_totals(i64::MIN, now_unix, now_unix, &[]).await {
             Ok(_) => info!(
                 elapsed_secs = started.elapsed().as_secs_f64(),
                 "statistics history ready"
@@ -418,29 +503,121 @@ impl AppState {
         }
     }
 
-    async fn recent_buckets(&self, range: Range, now_unix: i64) -> Result<Vec<TimedBucket>> {
-        let (from_unix, to_unix) = range.window(now_unix);
-        self.recent
-            .buckets(&self.db, from_unix, to_unix, now_unix)
-            .await
+    async fn recent_range(
+        &self,
+        groups: &[Group],
+        range: Range,
+        now_unix: i64,
+    ) -> Result<RangeTotals> {
+        let fetched = self.fetch_recent(groups, range, now_unix).await?;
+        Ok(RangeTotals {
+            window: fetched.window,
+            series: self.skip_idle_line_hours(groups, fetched.series),
+        })
     }
 
-    async fn history_buckets(
+    async fn fetch_recent(
+        &self,
+        groups: &[Group],
+        range: Range,
+        now_unix: i64,
+    ) -> Result<RangeTotals> {
+        let source = RecentSource::of(groups, range);
+        let window = source.window(range, now_unix);
+        let series = match source {
+            RecentSource::Minutes => {
+                self.recent
+                    .totals(&self.db, window.0, window.1, now_unix, groups)
+                    .await?
+            }
+            RecentSource::LineMinutes => {
+                self.recent_lines
+                    .totals(&self.db, window.0, window.1, now_unix, groups)
+                    .await?
+            }
+            RecentSource::Quarters => {
+                self.history_totals(window.0, window.1, now_unix, groups)
+                    .await?
+            }
+        };
+        Ok(RangeTotals { window, series })
+    }
+
+    async fn recent_ranges(
+        &self,
+        groups: &[Group],
+        now_unix: i64,
+    ) -> Result<Vec<(Range, RangeTotals)>> {
+        let mut ranges = Vec::with_capacity(Range::ALL.len());
+        let mut longest: Option<(RecentSource, RangeTotals)> = None;
+        for range in Range::ALL.into_iter().rev() {
+            let source = RecentSource::of(groups, range);
+            let fetched = match longest.take() {
+                Some((fetched_source, fetched)) if fetched_source == source => fetched,
+                _ => self.fetch_recent(groups, range, now_unix).await?,
+            };
+            let in_range = fetched.since(source.window(range, now_unix).0);
+            ranges.push((
+                range,
+                RangeTotals {
+                    window: in_range.window,
+                    series: self.skip_idle_line_hours(groups, in_range.series),
+                },
+            ));
+            longest = Some((source, fetched));
+        }
+        ranges.reverse();
+        Ok(ranges)
+    }
+
+    async fn period_totals(
         &self,
         from_unix: i64,
         to_unix: i64,
         now_unix: i64,
-    ) -> Result<Vec<TimedBucket>> {
+        groups: &[Group],
+    ) -> Result<Vec<Vec<TimedTotals>>> {
+        let series = self
+            .history_totals(from_unix, to_unix, now_unix, groups)
+            .await?;
+        Ok(self.skip_idle_line_hours(groups, series))
+    }
+
+    fn skip_idle_line_hours(
+        &self,
+        groups: &[Group],
+        series: Vec<Vec<TimedTotals>>,
+    ) -> Vec<Vec<TimedTotals>> {
+        groups
+            .iter()
+            .zip(series)
+            .map(|(group, series)| match group {
+                Group::Line(_) => {
+                    stats::skip_idle_hours(&series, |unix| HOUR_STEP.start_of(unix, &self.tz))
+                }
+                Group::Kind(_) => series,
+            })
+            .collect()
+    }
+
+    async fn history_totals(
+        &self,
+        from_unix: i64,
+        to_unix: i64,
+        now_unix: i64,
+        groups: &[Group],
+    ) -> Result<Vec<Vec<TimedTotals>>> {
+        let empty = || vec![Vec::new(); groups.len()];
         let Some(first_unix) = self.db.first_seen_unix().await? else {
-            return Ok(Vec::new());
+            return Ok(empty());
         };
         let from_unix = from_unix.max(first_unix);
         let to_unix = to_unix.min(now_unix);
         if from_unix >= to_unix {
-            return Ok(Vec::new());
+            return Ok(empty());
         }
         self.history
-            .buckets(&self.db, from_unix, to_unix, now_unix)
+            .totals(&self.db, from_unix, to_unix, now_unix, groups)
             .await
     }
 
@@ -453,31 +630,191 @@ pub fn router(db: Db, clock: Clock) -> Router {
     app(AppState::new(db, clock))
 }
 
+fn period_route(kind: PeriodKind) -> String {
+    format!("/{}/{{period}}", kind.slug())
+}
+
+fn type_and_line_paths(vehicle_type: VehicleType) -> (String, String) {
+    let type_path = format!("/{}", vehicle_type.as_str());
+    let line_path = format!("{type_path}/{{line}}");
+    (type_path, line_path)
+}
+
+fn quality_route(path: &str) -> String {
+    format!("{path}/{QUALITY_SEGMENT}")
+}
+
 fn app(state: AppState) -> Router {
     let mut router = Router::new()
-        .route(OVERVIEW_PATH, get(index))
-        .route(OVERVIEW_QUALITY_PATH, get(quality::overview))
-        .route("/charts/{file}", get(chart));
+        .route(
+            OVERVIEW_PATH,
+            get(
+                |State(state): State<AppState>, Query(query): Query<RangeQuery>| {
+                    overview(state, SelectionKey::All, query.range)
+                },
+            ),
+        )
+        .route(
+            OVERVIEW_QUALITY_PATH,
+            get(
+                |State(state): State<AppState>, Query(query): Query<RangeQuery>| {
+                    quality::overview(state, SelectionKey::All, query.range)
+                },
+            ),
+        )
+        .route(
+            CHARTS_PATH,
+            get(
+                |State(state): State<AppState>,
+                 Path(file): Path<String>,
+                 Query(query): Query<RangeQuery>| {
+                    chart(state, SelectionKey::All, file, query.range)
+                },
+            ),
+        );
     for kind in PeriodKind::ALL {
         router = router
             .route(
-                &format!("/{}/{{period}}", kind.slug()),
+                &period_route(kind),
                 get(
                     move |State(state): State<AppState>, Path(slug): Path<String>| {
-                        period_page(state, kind, slug)
+                        period_page(state, SelectionKey::All, kind, slug)
                     },
                 ),
             )
             .route(
-                &format!("/{}/{{period}}/quality", kind.slug()),
+                &quality_route(&period_route(kind)),
                 get(
                     move |State(state): State<AppState>, Path(slug): Path<String>| {
-                        quality::period_page(state, kind, slug)
+                        quality::period_page(state, SelectionKey::All, kind, slug)
                     },
                 ),
             );
     }
+    for vehicle_type in VehicleType::ALL {
+        router = vehicle_type_routes(router, vehicle_type);
+    }
     router.with_state(state)
+}
+
+fn vehicle_type_routes(
+    mut router: Router<AppState>,
+    vehicle_type: VehicleType,
+) -> Router<AppState> {
+    let (type_path, line_path) = type_and_line_paths(vehicle_type);
+    router = router
+        .route(
+            &type_path,
+            get(
+                move |State(state): State<AppState>, Query(query): Query<RangeQuery>| {
+                    overview(state, SelectionKey::Type(vehicle_type), query.range)
+                },
+            ),
+        )
+        .route(
+            &line_path,
+            get(
+                move |State(state): State<AppState>,
+                      Path(line): Path<String>,
+                      Query(query): Query<RangeQuery>| {
+                    overview(state, SelectionKey::Line(vehicle_type, line), query.range)
+                },
+            ),
+        )
+        .route(
+            &format!("{type_path}{CHARTS_PATH}"),
+            get(
+                move |State(state): State<AppState>,
+                      Path(file): Path<String>,
+                      Query(query): Query<RangeQuery>| {
+                    chart(state, SelectionKey::Type(vehicle_type), file, query.range)
+                },
+            ),
+        )
+        .route(
+            &format!("{line_path}{CHARTS_PATH}"),
+            get(
+                move |State(state): State<AppState>,
+                      Path((line, file)): Path<(String, String)>,
+                      Query(query): Query<RangeQuery>| {
+                    chart(
+                        state,
+                        SelectionKey::Line(vehicle_type, line),
+                        file,
+                        query.range,
+                    )
+                },
+            ),
+        )
+        .route(
+            &quality_route(&type_path),
+            get(
+                move |State(state): State<AppState>, Query(query): Query<RangeQuery>| {
+                    quality::overview(state, SelectionKey::Type(vehicle_type), query.range)
+                },
+            ),
+        )
+        .route(
+            &quality_route(&line_path),
+            get(
+                move |State(state): State<AppState>,
+                      Path(line): Path<String>,
+                      Query(query): Query<RangeQuery>| {
+                    quality::overview(state, SelectionKey::Line(vehicle_type, line), query.range)
+                },
+            ),
+        );
+    vehicle_type_period_routes(router, vehicle_type)
+}
+
+fn vehicle_type_period_routes(
+    mut router: Router<AppState>,
+    vehicle_type: VehicleType,
+) -> Router<AppState> {
+    let (type_path, line_path) = type_and_line_paths(vehicle_type);
+    for kind in PeriodKind::ALL {
+        router = router
+            .route(
+                &format!("{type_path}{}", period_route(kind)),
+                get(
+                    move |State(state): State<AppState>, Path(slug): Path<String>| {
+                        period_page(state, SelectionKey::Type(vehicle_type), kind, slug)
+                    },
+                ),
+            )
+            .route(
+                &format!("{line_path}{}", period_route(kind)),
+                get(
+                    move |State(state): State<AppState>,
+                          Path((line, slug)): Path<(String, String)>| {
+                        period_page(state, SelectionKey::Line(vehicle_type, line), kind, slug)
+                    },
+                ),
+            )
+            .route(
+                &quality_route(&format!("{type_path}{}", period_route(kind))),
+                get(
+                    move |State(state): State<AppState>, Path(slug): Path<String>| {
+                        quality::period_page(state, SelectionKey::Type(vehicle_type), kind, slug)
+                    },
+                ),
+            )
+            .route(
+                &quality_route(&format!("{line_path}{}", period_route(kind))),
+                get(
+                    move |State(state): State<AppState>,
+                          Path((line, slug)): Path<(String, String)>| {
+                        quality::period_page(
+                            state,
+                            SelectionKey::Line(vehicle_type, line),
+                            kind,
+                            slug,
+                        )
+                    },
+                ),
+            );
+    }
+    router
 }
 
 pub async fn serve(
@@ -515,32 +852,34 @@ struct RangeQuery {
     range: Range,
 }
 
-async fn index(
-    State(state): State<AppState>,
-    Query(query): Query<RangeQuery>,
-) -> Result<Markup, AppError> {
+async fn overview(
+    state: AppState,
+    key: SelectionKey,
+    selected: Range,
+) -> Result<Response, AppError> {
+    let Some(selection) = key.resolve(&state.db).await? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
     let now = state.clock.now();
     let now_unix = now.as_second();
-    let longest = state.recent_buckets(Range::LONGEST, now_unix).await?;
-    let totals = Range::ALL.map(|range| {
-        let (from_unix, _) = range.window(now_unix);
-        let buckets = longest.iter().filter(|b| b.start_unix >= from_unix);
-        (range, stats::sum(buckets))
+    let subjects = selection.subjects();
+    let groups = selection::groups(&subjects);
+    let ranges = state.recent_ranges(&groups, now_unix).await?;
+    let mut rows = vec![Vec::with_capacity(ranges.len()); subjects.len()];
+    for (range, totals) in &ranges {
+        for (rows, series) in rows.iter_mut().zip(&totals.series) {
+            rows.push((*range, stats::sum(series)));
+        }
+    }
+    let tables = selection::shown(&subjects, &rows, |rows: &Vec<(Range, Totals)>| {
+        rows.iter().any(|(_, totals)| totals.has_vehicles())
     });
-    let kinds = visible_kinds(&stats::sum(&longest));
-    let selected = query.range;
-    let (from_unix, to_unix) = selected.window(now_unix);
-    let buckets = state.recent_buckets(selected, now_unix).await?;
+    let chart = state.recent_range(&groups, selected, now_unix).await?;
+    let shown = selection::shown(&subjects, &chart.series, |series| has_vehicles(series));
     let caption = selected.label().to_lowercase();
     let mut figures = Vec::with_capacity(Metric::CHARTED.len());
     for metric in Metric::CHARTED {
-        let rendered = render_chart(
-            metric,
-            &buckets,
-            (from_unix, to_unix),
-            selected.chart(),
-            &state.tz,
-        )?;
+        let rendered = render_chart(metric, &shown, chart.window, selected.chart(), &state.tz)?;
         figures.push(chart_figure(
             metric.slug(),
             metric.label(),
@@ -549,32 +888,43 @@ async fn index(
             &rendered,
         )?);
     }
+    let (lines_from_unix, lines_to_unix) = Range::LONGEST.window(now_unix);
+    let lines = state
+        .db
+        .lines_seen_between(lines_from_unix, lines_to_unix)
+        .await?;
+    let page = Page::Overview(selected);
     let history = history_links(state.today())?;
+    let heading = match selection {
+        Selection::All => TITLE.to_owned(),
+        Selection::Type(_) | Selection::Line(_) => selection.label(),
+    };
     let body = html! {
         header {
-            h1 { (TITLE) }
+            h1 { (heading) }
             p #updated { "As of " (updated(now, &state.tz)) }
         }
+        (selection::vehicles_nav(&selection, page, &lines))
         nav #history aria-label="History" {
             @for (label, period) in &history {
-                a href=(period.path()) { (label) }
+                a href=(selection.period_path(*period)) { (label) }
             }
         }
         nav #pages aria-label="Pages" {
-            a #quality-link href=(OVERVIEW_QUALITY_PATH) { "Data quality" }
+            a #quality-link href=(selection.quality_path()) { "Data quality" }
         }
         main {
             section #summary {
                 h2 { "Summary" }
-                @for kind in &kinds {
-                    (range_table(*kind, &totals))
+                @for (subject, rows) in &tables {
+                    (range_table(subject, rows))
                 }
             }
             section #charts {
                 h2 { "Charts" }
                 nav aria-label="Chart range" {
                     @for range in Range::ALL {
-                        a href=(format!("/?range={}", range.slug()))
+                        a href=(selection.range_path(range))
                             aria-current=[(range == selected).then_some("page")] {
                             (range.label())
                         }
@@ -584,9 +934,14 @@ async fn index(
                     (figure)
                 }
             }
+            (selection::lines_section(&selection, page, &lines))
         }
     };
-    Ok(shell(TITLE, &body))
+    let title = match selection {
+        Selection::All => TITLE.to_owned(),
+        Selection::Type(_) | Selection::Line(_) => format!("{heading} – {TITLE}"),
+    };
+    Ok(shell(&title, &body).into_response())
 }
 
 fn history_links(today: Date) -> Result<Vec<(&'static str, Period)>> {
@@ -633,25 +988,33 @@ fn shell(title: &str, body: &Markup) -> Markup {
 
 async fn period_page(
     state: AppState,
+    key: SelectionKey,
     kind: PeriodKind,
     slug: String,
 ) -> Result<Response, AppError> {
     let Some(period) = Period::parse(kind, &slug) else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
+    let Some(selection) = key.resolve(&state.db).await? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
     let now = state.clock.now();
     let now_unix = now.as_second();
     let (from, to) = period.bounds(&state.tz)?;
     let (from_unix, to_unix) = (from.as_second(), to.as_second());
-    let buckets = state.history_buckets(from_unix, to_unix, now_unix).await?;
-    let total = stats::sum(&buckets);
-    let kinds = visible_kinds(&total);
+    let subjects = selection.subjects();
+    let groups = selection::groups(&subjects);
+    let series = state
+        .period_totals(from_unix, to_unix, now_unix, &groups)
+        .await?;
+    let shown = selection::shown(&subjects, &series, |series| has_vehicles(series));
     let caption = period.title();
+    let path = selection.period_path(period);
     let mut figures = Vec::with_capacity(Metric::CHARTED.len());
     for metric in Metric::CHARTED {
         let rendered = render_chart(
             metric,
-            &buckets,
+            &shown,
             (from_unix, to_unix),
             period.chart(),
             &state.tz,
@@ -660,10 +1023,12 @@ async fn period_page(
             metric.slug(),
             metric.label(),
             &caption,
-            &period.path(),
+            &path,
             &rendered,
         )?);
     }
+    let lines = state.db.lines_seen_between(from_unix, to_unix).await?;
+    let page = Page::Period(period);
     let previous = period.previous()?;
     let next = period.next()?;
     let next_started = next.start_date() <= state.today();
@@ -671,33 +1036,35 @@ async fn period_page(
     let parents = period.parents()?;
     let parts = period.parts()?;
     let noun = kind.slug();
+    let heading = selection.heading(&period.title());
     let body = html! {
         header {
             p .breadcrumbs {
-                a href=(OVERVIEW_PATH) { (OVERVIEW_LABEL) }
+                a href=(selection.overview_path()) { (OVERVIEW_LABEL) }
                 @for parent in &parents {
-                    " · " a href=(parent.path()) { (parent.title()) }
+                    " · " a href=(selection.period_path(*parent)) { (parent.title()) }
                 }
             }
-            h1 { (period.title()) }
+            h1 { (heading) }
             @if let Some(subtitle) = period.subtitle()? {
                 p .subtitle { (subtitle) }
             }
             @if in_progress {
                 p #updated { "So far, as of " (updated(now, &state.tz)) }
             }
+            (selection::vehicles_nav(&selection, page, &lines))
             nav .period-nav aria-label="Neighbouring periods" {
-                a #previous rel="prev" href=(previous.path()) { "← Previous " (noun) }
+                a #previous rel="prev" href=(selection.period_path(previous)) { "← Previous " (noun) }
                 @if next_started {
-                    a #next rel="next" href=(next.path()) { "Next " (noun) " →" }
+                    a #next rel="next" href=(selection.period_path(next)) { "Next " (noun) " →" }
                 }
-                a #quality-link href=(quality_path(period)) { "Data quality" }
+                a #quality-link href=(selection.period_quality_path(period)) { "Data quality" }
             }
         }
         main {
             section #summary {
                 h2 { "Summary" }
-                (period_table(&kinds, &total))
+                (period_table(&shown))
             }
             section #charts {
                 h2 { "Charts" }
@@ -710,14 +1077,15 @@ async fn period_page(
                     h2 { (part.kind().plural_label()) }
                     nav aria-label=(part.kind().plural_label()) {
                         @for part in &parts {
-                            a href=(part.path()) { (part.short_label()) }
+                            a href=(selection.period_path(*part)) { (part.short_label()) }
                         }
                     }
                 }
             }
+            (selection::lines_section(&selection, page, &lines))
         }
     };
-    Ok(shell(&format!("{} – {TITLE}", period.title()), &body).into_response())
+    Ok(shell(&format!("{heading} – {TITLE}"), &body).into_response())
 }
 
 fn chart_figure(
@@ -739,15 +1107,15 @@ fn chart_figure(
     })
 }
 
-fn range_table(kind: Kind, totals: &[(Range, Bucket)]) -> Markup {
+fn range_table(subject: &Subject, rows: &[(Range, Totals)]) -> Markup {
     html! {
         div .table-wrap {
-            table .stats #(format!("stats-{}", kind_slug(kind))) {
-                caption { (kind_label(kind)) }
+            table .stats #(format!("stats-{}", subject.slug)) {
+                caption { (subject.label) }
                 thead {
                     tr {
                         th scope="col" { "Metric" }
-                        @for (range, _) in totals {
+                        @for (range, _) in rows {
                             th scope="col" { (range.label()) }
                         }
                     }
@@ -756,8 +1124,8 @@ fn range_table(kind: Kind, totals: &[(Range, Bucket)]) -> Markup {
                     @for metric in Metric::ALL {
                         tr data-metric=(metric.slug()) {
                             th scope="row" { (metric.label()) }
-                            @for (range, total) in totals {
-                                td data-range=(range.slug()) { (metric.format(total.get(kind))) }
+                            @for (range, totals) in rows {
+                                td data-range=(range.slug()) { (metric.format(totals)) }
                             }
                         }
                     }
@@ -767,15 +1135,19 @@ fn range_table(kind: Kind, totals: &[(Range, Bucket)]) -> Markup {
     }
 }
 
-fn period_table(kinds: &[Kind], total: &Bucket) -> Markup {
+fn period_table(shown: &[(&Subject, &Vec<TimedTotals>)]) -> Markup {
+    let totals: Vec<(&Subject, Totals)> = shown
+        .iter()
+        .map(|(subject, series)| (*subject, stats::sum(series.iter())))
+        .collect();
     html! {
         div .table-wrap {
             table .stats #period-stats {
                 thead {
                     tr {
                         th scope="col" { "Metric" }
-                        @for kind in kinds {
-                            th scope="col" data-kind=(kind_slug(*kind)) { (kind_label(*kind)) }
+                        @for (subject, _) in &totals {
+                            th scope="col" data-kind=(subject.slug) { (subject.label) }
                         }
                     }
                 }
@@ -783,8 +1155,8 @@ fn period_table(kinds: &[Kind], total: &Bucket) -> Markup {
                     @for metric in Metric::ALL {
                         tr data-metric=(metric.slug()) {
                             th scope="row" { (metric.label()) }
-                            @for kind in kinds {
-                                td data-kind=(kind_slug(*kind)) { (metric.format(total.get(*kind))) }
+                            @for (subject, total) in &totals {
+                                td data-kind=(subject.slug) { (metric.format(total)) }
                             }
                         }
                     }
@@ -795,43 +1167,42 @@ fn period_table(kinds: &[Kind], total: &Bucket) -> Markup {
 }
 
 async fn chart(
-    State(state): State<AppState>,
-    Path(file): Path<String>,
-    Query(query): Query<RangeQuery>,
+    state: AppState,
+    key: SelectionKey,
+    file: String,
+    range: Range,
 ) -> Result<Response, AppError> {
     let Some(metric) = Metric::from_chart_file(&file) else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
-    let range = query.range;
+    let Some(selection) = key.resolve(&state.db).await? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let subjects = selection.subjects();
+    let groups = selection::groups(&subjects);
     let now_unix = state.clock.now().as_second();
-    let buckets = state.recent_buckets(range, now_unix).await?;
-    let rendered = render_chart(
-        metric,
-        &buckets,
-        range.window(now_unix),
-        range.chart(),
-        &state.tz,
-    )?;
+    let totals = state.recent_range(&groups, range, now_unix).await?;
+    let shown = selection::shown(&subjects, &totals.series, |series| has_vehicles(series));
+    let rendered = render_chart(metric, &shown, totals.window, range.chart(), &state.tz)?;
     Ok(([(header::CONTENT_TYPE, SVG_CONTENT_TYPE)], rendered.svg).into_response())
 }
 
 fn render_chart(
     metric: Metric,
-    buckets: &[TimedBucket],
+    shown: &[(&Subject, &Vec<TimedTotals>)],
     (from_unix, to_unix): (i64, i64),
     spec: ChartSpec,
     tz: &TimeZone,
 ) -> Result<Rendered> {
-    let grouped = stats::regroup_by(buckets, |start_unix| spec.step.start_of(start_unix, tz));
-    let series = visible_kinds(&stats::sum(buckets))
-        .into_iter()
-        .map(|kind| Series {
-            name: kind_label(kind).to_owned(),
-            color: kind_color(kind),
-            points: grouped
+    let series = shown
+        .iter()
+        .map(|(subject, series)| Series {
+            name: subject.label.clone(),
+            color: subject.color,
+            points: stats::regroup_by(series, |start_unix| spec.step.start_of(start_unix, tz))
                 .iter()
                 .map(|timed| {
-                    let value = metric.value(timed.bucket.get(kind));
+                    let value = metric.value(&timed.totals);
                     Point {
                         unix: timed.start_unix.max(from_unix),
                         value,
@@ -863,7 +1234,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::db::{OpenMode, PositionCount};
+    use crate::db::{LinePositionCount, OpenMode};
     use crate::fetch::Source;
     use crate::geo::MicroDegrees;
     use crate::mpk::Position;
@@ -983,6 +1354,288 @@ mod tests {
         );
     }
 
+    const BUS_LINE: &str = "a";
+    const OTHER_BUS_LINE: &str = "b";
+    const TRAM_LINE: &str = "1";
+
+    async fn db_with_a_bus_and_a_tram() -> Db {
+        let db = db_with_a_bus().await;
+        let tram = Position {
+            vehicle_type: VehicleType::Tram,
+            line: TRAM_LINE.to_owned(),
+            course_id: 2,
+            latitude: MicroDegrees(51_100_000),
+            longitude: MicroDegrees(17_000_000),
+        };
+        let mut unix = NOW - DRIVE_SECS;
+        while unix < NOW {
+            db.save_positions(unix, &[&tram], &[]).await.unwrap();
+            unix += FETCH_SECS;
+        }
+        db
+    }
+
+    #[tokio::test]
+    async fn type_and_line_pages_show_only_their_vehicles() {
+        let db = db_with_a_bus_and_a_tram().await;
+        let everywhere = |value: &str| vec![value.to_owned(); Range::ALL.len()];
+        let all = get(&db, "/").await.body;
+        assert_eq!(tables(&all), ["stats-all", "stats-bus", "stats-tram"]);
+
+        let bus_line = get(&db, &format!("/bus/{BUS_LINE}")).await;
+        assert_eq!(bus_line.status, StatusCode::OK);
+        let html = &bus_line.body;
+        assert_eq!(select_texts(html, "h1"), [format!("Bus {BUS_LINE}")]);
+        assert_eq!(tables(html), [format!("stats-bus-{BUS_LINE}")]);
+        let line_cells = |metric: Metric| {
+            select_texts(
+                html,
+                &format!("#stats-bus-{BUS_LINE} tr[data-metric={}] td", metric.slug()),
+            )
+        };
+        assert_eq!(line_cells(Metric::AverageSpeed), everywhere("36.0"));
+        assert_eq!(line_cells(Metric::AverageVehicles), everywhere("1.0"));
+        assert_eq!(line_cells(Metric::Distance), everywhere("3"));
+        let speed = hover_data(html, Metric::AverageSpeed.slug());
+        assert_eq!(series_names(&speed), [format!("Bus {BUS_LINE}")]);
+
+        let trams = get(&db, "/tram?range=week").await.body;
+        assert_eq!(select_texts(&trams, "h1"), ["Trams"]);
+        assert_eq!(tables(&trams), ["stats-tram"]);
+        let tram = Kind::Vehicle(VehicleType::Tram);
+        assert_eq!(cells(&trams, tram, Metric::AverageSpeed), everywhere("0.0"));
+        assert_eq!(
+            series_names(&hover_data(&trams, Metric::AverageVehicles.slug())),
+            ["Trams"]
+        );
+
+        let chart = get(
+            &db,
+            &format!("/bus/{BUS_LINE}/charts/average-speed.svg?range=month"),
+        )
+        .await;
+        assert_eq!(chart.status, StatusCode::OK);
+        assert_eq!(chart.content_type.as_deref(), Some(SVG_CONTENT_TYPE));
+        let buses = get(&db, "/bus/charts/average-speed.svg?range=month").await;
+        assert_eq!(
+            chart.body, buses.body,
+            "the only bus line draws like all buses"
+        );
+        assert!(!chart.body.lines().any(|line| line == "All vehicles"));
+    }
+
+    #[tokio::test]
+    async fn period_pages_of_a_line_total_only_that_line() {
+        let db = db_with_a_bus_and_a_tram().await;
+        for kind in PeriodKind::ALL {
+            let period = containing_the_drive(kind);
+            let path = format!("/tram/{TRAM_LINE}{}", period.path());
+            let page = get(&db, &path).await;
+            assert_eq!(page.status, StatusCode::OK, "{path}");
+            let html = &page.body;
+            assert_eq!(
+                select_texts(html, "h1"),
+                [format!("Tram {TRAM_LINE}: {}", period.title())]
+            );
+            assert_eq!(
+                select_attributes(html, "#period-stats thead th[data-kind]", "data-kind"),
+                [format!("tram-{TRAM_LINE}")]
+            );
+            assert_eq!(period_cells(html, Metric::AverageSpeed), ["0.0"]);
+            assert_eq!(period_cells(html, Metric::AverageVehicles), ["1.0"]);
+            assert_eq!(
+                select_attributes(html, "figure.chart", "data-range"),
+                [path.clone(), path.clone()]
+            );
+        }
+        let week = containing_the_drive(PeriodKind::Week);
+        let buses = get(&db, &format!("/bus{}", week.path())).await.body;
+        assert_eq!(
+            select_attributes(&buses, "#period-stats thead th[data-kind]", "data-kind"),
+            ["bus"]
+        );
+        assert_eq!(period_cells(&buses, Metric::Distance), ["3"]);
+    }
+
+    #[tokio::test]
+    async fn links_keep_the_selection_and_the_period() {
+        let db = db_with_a_bus_and_a_tram().await;
+        let week = containing_the_drive(PeriodKind::Week);
+        let line_prefix = format!("/bus/{BUS_LINE}");
+        let html = get(&db, &format!("{line_prefix}{}", week.path()))
+            .await
+            .body;
+        assert_eq!(
+            select_attributes(&html, "#vehicles a", "href"),
+            [
+                week.path(),
+                format!("/bus{}", week.path()),
+                format!("/tram{}", week.path()),
+            ]
+        );
+        assert!(select_texts(&html, "#vehicles a[aria-current=page]").is_empty());
+        assert_eq!(
+            select_attributes(&html, "#lines a", "href"),
+            [format!("{line_prefix}{}", week.path())]
+        );
+        assert_eq!(
+            select_texts(&html, "#lines a[aria-current=page]"),
+            [BUS_LINE]
+        );
+        assert_eq!(
+            select_attributes(&html, "#previous", "href"),
+            [format!("{line_prefix}{}", week.previous().unwrap().path())]
+        );
+        let mut breadcrumbs = vec![line_prefix.clone()];
+        breadcrumbs.extend(
+            week.parents()
+                .unwrap()
+                .iter()
+                .map(|parent| format!("{line_prefix}{}", parent.path())),
+        );
+        assert_eq!(
+            select_attributes(&html, ".breadcrumbs a", "href"),
+            breadcrumbs
+        );
+        let days = select_attributes(&html, "#parts a", "href");
+        assert_eq!(days.len(), 7);
+        assert!(days.iter().all(|day| day.starts_with(&line_prefix)));
+        assert_eq!(
+            select_attributes(&html, "#quality-link", "href"),
+            [format!("{line_prefix}{}/quality", week.path())]
+        );
+
+        let all = get(&db, &week.path()).await.body;
+        assert_eq!(
+            select_attributes(&all, "#lines nav", "data-kind"),
+            ["bus", "tram"]
+        );
+        assert_eq!(
+            select_attributes(&all, "#lines a", "href"),
+            [
+                format!("{line_prefix}{}", week.path()),
+                format!("/tram/{TRAM_LINE}{}", week.path()),
+            ]
+        );
+
+        let trams = get(&db, "/tram?range=week").await.body;
+        assert_eq!(
+            select_attributes(&trams, "#vehicles a", "href"),
+            ["/?range=week", "/bus?range=week", "/tram?range=week"]
+        );
+        assert_eq!(
+            select_texts(&trams, "#vehicles a[aria-current=page]"),
+            ["Trams"]
+        );
+        assert_eq!(
+            select_attributes(&trams, "#charts nav a", "href"),
+            [
+                "/tram?range=hour",
+                "/tram?range=day",
+                "/tram?range=week",
+                "/tram?range=month"
+            ]
+        );
+        assert_eq!(
+            select_attributes(&trams, "#lines a", "href"),
+            [format!("/tram/{TRAM_LINE}?range=week")]
+        );
+        let history = select_attributes(&trams, "#history a", "href");
+        assert_eq!(
+            history[0],
+            format!("/tram{}", containing(PeriodKind::Day).path())
+        );
+    }
+
+    fn step_value_texts(hover: &serde_json::Value) -> Vec<String> {
+        hover["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(step_texts)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn line_averages_skip_hours_without_its_vehicles() {
+        let db = empty_db().await;
+        let tz = TimeZone::system();
+        let day = local_date(NOW).yesterday().unwrap();
+        let at = |hour| {
+            day.at(hour, 0, 0, 0)
+                .to_zoned(tz.clone())
+                .unwrap()
+                .timestamp()
+                .as_second()
+        };
+        let parked = |vehicle_type, line: &str, course_id| Position {
+            vehicle_type,
+            line: line.to_owned(),
+            course_id,
+            latitude: MicroDegrees(51_100_000),
+            longitude: MicroDegrees(17_000_000),
+        };
+        let tram = parked(VehicleType::Tram, TRAM_LINE, 2);
+        let bus = parked(VehicleType::Bus, BUS_LINE, 1);
+        let bus_hours = at(10)..at(11);
+        let mut unix = at(9);
+        while unix < at(12) {
+            let seen: Vec<&Position> = if bus_hours.contains(&unix) {
+                vec![&tram, &bus]
+            } else {
+                vec![&tram]
+            };
+            db.save_positions(unix, &seen, &[]).await.unwrap();
+            unix += FETCH_SECS;
+        }
+        let period = Period::containing(PeriodKind::Day, day).unwrap();
+
+        let line = get(&db, &format!("/bus/{BUS_LINE}{}", period.path()))
+            .await
+            .body;
+        assert_eq!(period_cells(&line, Metric::AverageVehicles), ["1.0"]);
+        assert_eq!(period_cells(&line, Metric::PeakVehicles), ["1"]);
+        let line_steps = step_value_texts(&hover_data(&line, Metric::AverageVehicles.slug()));
+        assert!(line_steps.contains(&"1.0".to_owned()), "{line_steps:?}");
+        assert!(!line_steps.contains(&"0.0".to_owned()), "{line_steps:?}");
+
+        let buses = get(&db, &format!("/bus{}", period.path())).await.body;
+        assert_eq!(period_cells(&buses, Metric::AverageVehicles), ["0.3"]);
+        let bus_steps = step_value_texts(&hover_data(&buses, Metric::AverageVehicles.slug()));
+        assert!(bus_steps.contains(&"0.0".to_owned()), "{bus_steps:?}");
+
+        let tram_line = get(&db, &format!("/tram/{TRAM_LINE}{}", period.path()))
+            .await
+            .body;
+        assert_eq!(period_cells(&tram_line, Metric::AverageVehicles), ["1.0"]);
+    }
+
+    #[tokio::test]
+    async fn unknown_lines_are_not_found() {
+        let db = db_with_a_bus().await;
+        let day = containing_the_drive(PeriodKind::Day);
+        for uri in [
+            "/bus/zzz".to_owned(),
+            format!("/tram/{BUS_LINE}"),
+            format!("/bus/zzz{}", day.path()),
+            format!("/bus/{BUS_LINE}/day/2027-13-01"),
+            "/bus/zzz/charts/average-speed.svg".to_owned(),
+            format!("/bus/{BUS_LINE}/charts/distance.svg"),
+            "/ship".to_owned(),
+        ] {
+            assert_eq!(get(&db, &uri).await.status, StatusCode::NOT_FOUND, "{uri}");
+        }
+        assert_eq!(
+            get(&db, &format!("/bus/{BUS_LINE}?range=year"))
+                .await
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        let empty_type = get(&db, "/train").await;
+        assert_eq!(empty_type.status, StatusCode::OK);
+        assert_eq!(tables(&empty_type.body), ["stats-train"]);
+    }
+
     #[tokio::test]
     async fn shows_missing_values_without_data() {
         let db = empty_db().await;
@@ -1001,13 +1654,13 @@ mod tests {
         let db = db_with_a_bus().await;
         let default = get(&db, "/").await.body;
         assert_eq!(
-            select_texts(&default, "nav a[aria-current=page]"),
+            select_texts(&default, "#charts nav a[aria-current=page]"),
             [Range::default().label()]
         );
 
         let html = get(&db, "/?range=week").await.body;
         assert_eq!(
-            select_texts(&html, "nav a[aria-current=page]"),
+            select_texts(&html, "#charts nav a[aria-current=page]"),
             [Range::Week.label()]
         );
         assert_eq!(
@@ -1346,8 +1999,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let count = |vehicle_type, received, invalid| PositionCount {
+        let count = |vehicle_type, line: &str, received, invalid| LinePositionCount {
             vehicle_type,
+            line: line.to_owned(),
             received,
             invalid,
         };
@@ -1356,8 +2010,9 @@ mod tests {
             &[],
             &[],
             &[
-                count(VehicleType::Bus, 10, 2),
-                count(VehicleType::Tram, 5, 0),
+                count(VehicleType::Bus, BUS_LINE, 6, 2),
+                count(VehicleType::Bus, OTHER_BUS_LINE, 4, 0),
+                count(VehicleType::Tram, TRAM_LINE, 5, 0),
             ],
         )
         .await
@@ -1461,7 +2116,9 @@ mod tests {
     async fn period_quality_pages_show_the_period() {
         let db = db_with_quality_counts().await;
         let day = Period::containing(PeriodKind::Day, local_date(QUALITY_RECENTLY)).unwrap();
-        let html = get(&db, &quality_path(day)).await.body;
+        let html = get(&db, &Selection::All.period_quality_path(day))
+            .await
+            .body;
         assert_eq!(
             select_texts(&html, "h1"),
             [format!("Data quality: {}", day.title())]
@@ -1484,10 +2141,15 @@ mod tests {
         );
         assert_eq!(
             select_attributes(&html, "#previous", "href"),
-            [quality_path(day.previous().unwrap())]
+            [Selection::All.period_quality_path(day.previous().unwrap())]
         );
         let mut breadcrumbs = vec![OVERVIEW_QUALITY_PATH.to_owned()];
-        breadcrumbs.extend(day.parents().unwrap().into_iter().map(quality_path));
+        breadcrumbs.extend(
+            day.parents()
+                .unwrap()
+                .into_iter()
+                .map(|period| Selection::All.period_quality_path(period)),
+        );
         assert_eq!(
             select_attributes(&html, ".breadcrumbs a", "href"),
             breadcrumbs
@@ -1495,7 +2157,7 @@ mod tests {
         let failed = hover_data(&html, "failed-downloads");
         assert_eq!(
             select_attributes(&html, "#chart-failed-downloads", "data-range"),
-            [quality_path(day)]
+            [Selection::All.period_quality_path(day)]
         );
         assert_eq!(series_names(&failed)[0], "MPK positions");
         assert!(
@@ -1507,17 +2169,21 @@ mod tests {
         );
 
         let month = Period::containing(PeriodKind::Month, local_date(QUALITY_RECENTLY)).unwrap();
-        let html = get(&db, &quality_path(month)).await.body;
+        let html = get(&db, &Selection::All.period_quality_path(month))
+            .await
+            .body;
         let days: Vec<String> = month
             .parts()
             .unwrap()
             .into_iter()
-            .map(quality_path)
+            .map(|period| Selection::All.period_quality_path(period))
             .collect();
         assert_eq!(select_attributes(&html, "#parts a", "href"), days);
 
         let before = day.previous().unwrap().previous().unwrap();
-        let html = get(&db, &quality_path(before)).await.body;
+        let html = get(&db, &Selection::All.period_quality_path(before))
+            .await
+            .body;
         assert_eq!(
             select_attributes(&html, "#invalid-positions tbody tr", "data-kind"),
             ["all"]
@@ -1526,6 +2192,111 @@ mod tests {
             get(&db, "/day/2027-13-01/quality").await.status,
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn quality_pages_of_a_type_or_line_show_only_their_positions() {
+        let db = db_with_quality_counts().await;
+        let invalid = |html: &str, range: &str| {
+            text(
+                html,
+                &format!("#invalid-positions tbody tr td[data-range={range}]"),
+            )
+        };
+        let failed = |html: &str| {
+            text(
+                html,
+                "#fetch-failures tr[data-source=mpk-positions] td[data-range=hour]",
+            )
+        };
+
+        let line = get(&db, &format!("/bus/{BUS_LINE}/quality?range=hour")).await;
+        assert_eq!(line.status, StatusCode::OK);
+        let html = &line.body;
+        assert_eq!(
+            select_texts(html, "h1"),
+            [format!("Data quality: Bus {BUS_LINE}")]
+        );
+        assert_eq!(
+            select_attributes(html, "#invalid-positions tbody tr", "data-kind"),
+            [format!("bus-{BUS_LINE}")]
+        );
+        assert_eq!(invalid(html, "hour"), "33.3%");
+        assert!(select_texts(html, "#fetch-failures").is_empty());
+        assert_eq!(
+            select_attributes(html, "figure.chart", "id"),
+            ["chart-invalid-positions"]
+        );
+        assert_eq!(
+            series_names(&hover_data(html, "invalid-positions")),
+            [format!("Bus {BUS_LINE}")]
+        );
+        assert_eq!(
+            select_attributes(html, "#charts nav a", "href")[0],
+            format!("/bus/{BUS_LINE}/quality?range=hour")
+        );
+        assert_eq!(
+            select_attributes(html, ".breadcrumbs a", "href"),
+            [format!("/bus/{BUS_LINE}")]
+        );
+
+        let buses = get(&db, "/bus/quality").await.body;
+        assert_eq!(
+            select_attributes(&buses, "#invalid-positions tbody tr", "data-kind"),
+            ["bus"]
+        );
+        assert_eq!(invalid(&buses, "day"), "20.0%");
+        assert!(select_texts(&buses, "#fetch-failures").is_empty());
+        let all = get(&db, OVERVIEW_QUALITY_PATH).await.body;
+        assert_eq!(failed(&all), "33.3%");
+        assert!(!select_texts(&all, "#chart-failed-downloads").is_empty());
+
+        let day = Period::containing(PeriodKind::Day, local_date(QUALITY_RECENTLY)).unwrap();
+        let other = Selection::Line(
+            db.line(VehicleType::Bus, OTHER_BUS_LINE)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let html = get(&db, &other.period_quality_path(day)).await.body;
+        assert_eq!(
+            select_texts(&html, "h1"),
+            [format!(
+                "Data quality: Bus {OTHER_BUS_LINE}, {}",
+                day.title()
+            )]
+        );
+        assert_eq!(text(&html, "#invalid-positions tbody tr td"), "0%");
+        assert!(select_texts(&html, "#fetch-failures").is_empty());
+        assert_eq!(
+            select_attributes(&html, "figure.chart", "id"),
+            ["chart-invalid-positions"]
+        );
+        assert_eq!(
+            select_attributes(&html, "#statistics-link", "href"),
+            [other.period_path(day)]
+        );
+        assert_eq!(
+            select_attributes(&html, "#previous", "href"),
+            [other.period_quality_path(day.previous().unwrap())]
+        );
+        assert_eq!(
+            select_attributes(&html, "#vehicles a", "href")[0],
+            Selection::All.period_quality_path(day)
+        );
+
+        let statistics = get(&db, &other.period_path(day)).await.body;
+        assert_eq!(
+            select_attributes(&statistics, "#quality-link", "href"),
+            [other.period_quality_path(day)]
+        );
+        for uri in [
+            "/bus/zzz/quality".to_owned(),
+            format!("/bus/zzz{}/quality", day.path()),
+            format!("/tram/{BUS_LINE}/quality"),
+        ] {
+            assert_eq!(get(&db, &uri).await.status, StatusCode::NOT_FOUND, "{uri}");
+        }
     }
 
     #[test]

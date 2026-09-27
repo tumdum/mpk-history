@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use parking_lot::Mutex;
 
 use crate::db::{self, Db, TypedPathPoint};
@@ -41,6 +41,18 @@ impl Kind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    Kind(Kind),
+    Line(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detail {
+    Kinds,
+    Lines,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct Totals {
     samples: u64,
@@ -51,7 +63,7 @@ pub struct Totals {
 }
 
 impl Totals {
-    fn add(&mut self, other: &Totals) {
+    pub fn add(&mut self, other: &Totals) {
         self.samples += other.samples;
         self.vehicle_samples += other.vehicle_samples;
         self.peak_vehicles = self.peak_vehicles.max(other.peak_vehicles);
@@ -99,52 +111,183 @@ impl Totals {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-pub struct Bucket([Totals; KIND_COUNT]);
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LineTotals {
+    line_id: i64,
+    vehicle_samples: u32,
+    peak_vehicles: u32,
+    travel_secs: u32,
+    distance_m: f32,
+}
 
-impl Bucket {
-    #[must_use]
-    pub fn get(&self, kind: Kind) -> &Totals {
-        &self.0[kind.index()]
+impl LineTotals {
+    fn new(line_id: i64) -> Self {
+        Self {
+            line_id,
+            vehicle_samples: 0,
+            peak_vehicles: 0,
+            travel_secs: 0,
+            distance_m: 0.0,
+        }
     }
 
-    fn get_mut(&mut self, kind: Kind) -> &mut Totals {
-        &mut self.0[kind.index()]
+    fn add(&mut self, other: &LineTotals) {
+        self.vehicle_samples = self.vehicle_samples.saturating_add(other.vehicle_samples);
+        self.peak_vehicles = self.peak_vehicles.max(other.peak_vehicles);
+        self.travel_secs = self.travel_secs.saturating_add(other.travel_secs);
+        self.distance_m += other.distance_m;
     }
 
-    pub fn add(&mut self, other: &Bucket) {
-        for (totals, other) in self.0.iter_mut().zip(&other.0) {
-            totals.add(other);
+    fn add_sample(&mut self, vehicles: u32) {
+        self.vehicle_samples = self.vehicle_samples.saturating_add(vehicles);
+        self.peak_vehicles = self.peak_vehicles.max(vehicles);
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn add_step(&mut self, distance_m: f64, travel_secs: i64) {
+        self.distance_m += distance_m as f32;
+        self.travel_secs = self
+            .travel_secs
+            .saturating_add(u32::try_from(travel_secs).unwrap_or(u32::MAX));
+    }
+
+    fn totals(&self, samples: u64) -> Totals {
+        Totals {
+            samples,
+            vehicle_samples: u64::from(self.vehicle_samples),
+            peak_vehicles: u64::from(self.peak_vehicles),
+            distance_m: f64::from(self.distance_m),
+            travel_secs: i64::from(self.travel_secs),
         }
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Bucket {
+    kinds: [Totals; KIND_COUNT],
+    lines: Vec<LineTotals>,
+}
+
+impl Bucket {
+    fn get(&self, kind: Kind) -> &Totals {
+        &self.kinds[kind.index()]
+    }
+
+    fn get_mut(&mut self, kind: Kind) -> &mut Totals {
+        &mut self.kinds[kind.index()]
+    }
+
+    fn line_mut(&mut self, line_id: i64) -> &mut LineTotals {
+        let index = match self
+            .lines
+            .binary_search_by_key(&line_id, |line| line.line_id)
+        {
+            Ok(index) => index,
+            Err(index) => {
+                self.lines.insert(index, LineTotals::new(line_id));
+                index
+            }
+        };
+        &mut self.lines[index]
+    }
+
+    fn totals(&self, group: Group) -> Totals {
+        match group {
+            Group::Kind(kind) => *self.get(kind),
+            Group::Line(line_id) => {
+                let samples = self.get(Kind::All).samples;
+                self.lines
+                    .binary_search_by_key(&line_id, |line| line.line_id)
+                    .map_or(
+                        Totals {
+                            samples,
+                            ..Totals::default()
+                        },
+                        |index| self.lines[index].totals(samples),
+                    )
+            }
+        }
+    }
+
+    fn add(&mut self, other: &Bucket) {
+        for (totals, other) in self.kinds.iter_mut().zip(&other.kinds) {
+            totals.add(other);
+        }
+        for other in &other.lines {
+            self.line_mut(other.line_id).add(other);
+        }
+    }
+
+    fn kept(mut self, detail: Detail) -> Self {
+        match detail {
+            Detail::Kinds => self.lines = Vec::new(),
+            Detail::Lines => self.lines.shrink_to_fit(),
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TimedBucket {
+    start_unix: i64,
+    bucket: Bucket,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TimedBucket {
+pub struct TimedTotals {
     pub start_unix: i64,
-    pub bucket: Bucket,
+    pub totals: Totals,
 }
 
 #[must_use]
-pub fn sum<'a>(buckets: impl IntoIterator<Item = &'a TimedBucket>) -> Bucket {
-    let mut total = Bucket::default();
-    for timed in buckets {
-        total.add(&timed.bucket);
+pub fn sum<'a>(series: impl IntoIterator<Item = &'a TimedTotals>) -> Totals {
+    let mut total = Totals::default();
+    for timed in series {
+        total.add(&timed.totals);
     }
     total
 }
 
 #[must_use]
-pub fn regroup(buckets: &[TimedBucket], step: Duration) -> Vec<TimedBucket> {
-    let step_secs = db::duration_secs(step);
-    regroup_by(buckets, |start_unix| align_down(start_unix, step_secs))
+pub fn regroup_by(series: &[TimedTotals], group_start: impl Fn(i64) -> i64) -> Vec<TimedTotals> {
+    let mut grouped: Vec<TimedTotals> = Vec::new();
+    for timed in series {
+        let start_unix = group_start(timed.start_unix);
+        match grouped.last_mut() {
+            Some(last) if last.start_unix == start_unix => last.totals.add(&timed.totals),
+            _ => grouped.push(TimedTotals {
+                start_unix,
+                totals: timed.totals,
+            }),
+        }
+    }
+    grouped
 }
 
+/// Empties every hour in which no vehicle was seen, so averages count only the hours
+/// the vehicles ran.
 #[must_use]
-pub fn regroup_by(buckets: &[TimedBucket], group_start: impl Fn(i64) -> i64) -> Vec<TimedBucket> {
+pub fn skip_idle_hours(
+    series: &[TimedTotals],
+    hour_start: impl Fn(i64) -> i64,
+) -> Vec<TimedTotals> {
+    series
+        .chunk_by(|a, b| hour_start(a.start_unix) == hour_start(b.start_unix))
+        .flat_map(|hour| {
+            let ran = sum(hour).has_vehicles();
+            hour.iter().map(move |timed| TimedTotals {
+                start_unix: timed.start_unix,
+                totals: if ran { timed.totals } else { Totals::default() },
+            })
+        })
+        .collect()
+}
+
+fn regroup(buckets: Vec<TimedBucket>, step: Duration) -> Vec<TimedBucket> {
+    let step_secs = db::duration_secs(step);
     let mut grouped: Vec<TimedBucket> = Vec::new();
     for timed in buckets {
-        let start_unix = group_start(timed.start_unix);
+        let start_unix = align_down(timed.start_unix, step_secs);
         match grouped.last_mut() {
             Some(last) if last.start_unix == start_unix => last.bucket.add(&timed.bucket),
             _ => grouped.push(TimedBucket {
@@ -184,6 +327,7 @@ pub enum Retention {
 pub struct StatsCache {
     resolution: Duration,
     retention: Retention,
+    detail: Detail,
     finished: Mutex<BTreeMap<i64, Bucket>>,
     computing: tokio::sync::Mutex<()>,
 }
@@ -191,22 +335,28 @@ pub struct StatsCache {
 impl StatsCache {
     /// `resolution` must be a whole number of minutes that divides six hours.
     #[must_use]
-    pub fn new(resolution: Duration, retention: Retention) -> Self {
+    pub fn new(resolution: Duration, retention: Retention, detail: Detail) -> Self {
         Self {
             resolution,
             retention,
+            detail,
             finished: Mutex::default(),
             computing: tokio::sync::Mutex::default(),
         }
     }
 
-    pub async fn buckets(
+    /// Returns one series per group, in the order of `groups`.
+    pub async fn totals(
         &self,
         db: &Db,
         from_unix: i64,
         to_unix: i64,
         now_unix: i64,
-    ) -> Result<Vec<TimedBucket>> {
+        groups: &[Group],
+    ) -> Result<Vec<Vec<TimedTotals>>> {
+        if self.detail == Detail::Kinds && groups.iter().any(|g| matches!(g, Group::Line(_))) {
+            bail!("this statistics cache keeps no per-line totals");
+        }
         let resolution_secs = db::duration_secs(self.resolution);
         let from_unix = align_down(from_unix, resolution_secs);
         let to_unix = align_up(to_unix, resolution_secs);
@@ -231,32 +381,37 @@ impl StatsCache {
                     .map(|(start_unix, bucket)| TimedBucket { start_unix, bucket })
                     .collect();
                 let mut finished = self.finished.lock();
-                for timed in regroup(&minutes, self.resolution) {
+                for timed in regroup(minutes, self.resolution) {
+                    let bucket = timed.bucket.kept(self.detail);
                     if timed.start_unix <= final_before_unix {
-                        finished.insert(timed.start_unix, timed.bucket);
+                        finished.insert(timed.start_unix, bucket);
                     } else {
-                        unfinished.insert(timed.start_unix, timed.bucket);
+                        unfinished.insert(timed.start_unix, bucket);
                     }
                 }
                 chunk_start_unix = chunk_end_unix;
             }
         }
         let mut finished = self.finished.lock();
-        let buckets = starts(from_unix, to_unix, resolution_secs)
-            .map(|start_unix| TimedBucket {
-                start_unix,
-                bucket: unfinished
-                    .get(&start_unix)
-                    .or_else(|| finished.get(&start_unix))
-                    .copied()
-                    .unwrap_or_default(),
-            })
-            .collect();
+        let mut series = vec![Vec::new(); groups.len()];
+        for start_unix in starts(from_unix, to_unix, resolution_secs) {
+            let bucket = unfinished
+                .get(&start_unix)
+                .or_else(|| finished.get(&start_unix));
+            for (group, series) in groups.iter().zip(&mut series) {
+                series.push(TimedTotals {
+                    start_unix,
+                    totals: bucket
+                        .map(|bucket| bucket.totals(*group))
+                        .unwrap_or_default(),
+                });
+            }
+        }
         if let Retention::Last(retention) = self.retention {
             let oldest_kept_unix = now_unix - db::duration_secs(retention) - resolution_secs;
             *finished = finished.split_off(&oldest_kept_unix);
         }
-        Ok(buckets)
+        Ok(series)
     }
 
     fn missing_range(&self, from_unix: i64, to_unix: i64) -> Option<(i64, i64)> {
@@ -278,7 +433,9 @@ fn compute(points: &[TypedPathPoint], from_unix: i64, to_unix: i64) -> Vec<Bucke
     let mut buckets: Vec<Bucket> = bucket_starts(from_unix, to_unix)
         .map(|_| Bucket::default())
         .collect();
-    add_vehicle_samples(points, from_unix, to_unix, &mut buckets);
+    let times = fetch_times(points, from_unix, to_unix);
+    add_vehicle_samples(points, &times, from_unix, &mut buckets);
+    add_line_samples(points, &times, from_unix, &mut buckets);
     add_steps(points, from_unix, to_unix, &mut buckets);
     buckets
 }
@@ -298,20 +455,23 @@ fn fetch_times(points: &[TypedPathPoint], from_unix: i64, to_unix: i64) -> Vec<i
     times
 }
 
+fn visible_at(times: &[i64], p: &TypedPathPoint) -> Option<(usize, usize)> {
+    let start = times.partition_point(|unix| *unix < p.point.first_seen_unix);
+    let end = times.partition_point(|unix| *unix <= p.point.last_seen_unix);
+    (start < end).then_some((start, end))
+}
+
 fn add_vehicle_samples(
     points: &[TypedPathPoint],
+    times: &[i64],
     from_unix: i64,
-    to_unix: i64,
     buckets: &mut [Bucket],
 ) {
-    let times = fetch_times(points, from_unix, to_unix);
     let mut changes = vec![[0i64; KIND_COUNT]; times.len() + 1];
     for p in points {
-        let start = times.partition_point(|unix| *unix < p.point.first_seen_unix);
-        let end = times.partition_point(|unix| *unix <= p.point.last_seen_unix);
-        if start >= end {
+        let Some((start, end)) = visible_at(times, p) else {
             continue;
-        }
+        };
         let kind = Kind::Vehicle(p.vehicle_type).index();
         changes[start][kind] += 1;
         changes[end][kind] -= 1;
@@ -330,6 +490,40 @@ fn add_vehicle_samples(
             all += count;
         }
         bucket.get_mut(Kind::All).add_sample(all);
+    }
+}
+
+fn add_line_samples(
+    points: &[TypedPathPoint],
+    times: &[i64],
+    from_unix: i64,
+    buckets: &mut [Bucket],
+) {
+    for line_points in points.chunk_by(|a, b| a.point.line_id == b.point.line_id) {
+        let Some(first) = line_points.first() else {
+            continue;
+        };
+        let mut changes = vec![0i64; times.len() + 1];
+        for p in line_points {
+            let Some((start, end)) = visible_at(times, p) else {
+                continue;
+            };
+            changes[start] += 1;
+            changes[end] -= 1;
+        }
+        let mut visible = 0i64;
+        for (unix, change) in times.iter().zip(&changes) {
+            visible += change;
+            let Ok(count) = u32::try_from(visible) else {
+                continue;
+            };
+            if count == 0 {
+                continue;
+            }
+            buckets[bucket_index(*unix, from_unix)]
+                .line_mut(first.point.line_id)
+                .add_sample(count);
+        }
     }
 }
 
@@ -359,6 +553,7 @@ fn collector_paused_after(fetches: &[i64], last_seen_unix: i64) -> bool {
 fn standing(current: &TypedPathPoint) -> Travel {
     Travel {
         kind: Kind::Vehicle(current.vehicle_type),
+        line_id: current.point.line_id,
         start_unix: current.point.first_seen_unix,
         end_unix: current.point.last_seen_unix,
         distance_m: 0.0,
@@ -382,6 +577,7 @@ fn step(current: &TypedPathPoint, next: &TypedPathPoint) -> Option<Travel> {
     }
     Some(Travel {
         kind: Kind::Vehicle(current.vehicle_type),
+        line_id: a.line_id,
         start_unix: a.first_seen_unix,
         end_unix: b.first_seen_unix,
         distance_m,
@@ -390,6 +586,7 @@ fn step(current: &TypedPathPoint, next: &TypedPathPoint) -> Option<Travel> {
 
 struct Travel {
     kind: Kind,
+    line_id: i64,
     start_unix: i64,
     end_unix: i64,
     distance_m: f64,
@@ -412,6 +609,7 @@ fn add_travel(buckets: &mut [Bucket], from_unix: i64, to_unix: i64, travel: &Tra
         let bucket = &mut buckets[bucket_index(piece_start_unix, from_unix)];
         bucket.get_mut(travel.kind).add_step(distance_m, secs);
         bucket.get_mut(Kind::All).add_step(distance_m, secs);
+        bucket.line_mut(travel.line_id).add_step(distance_m, secs);
         piece_start_unix = piece_end_unix;
     }
 }
@@ -426,9 +624,11 @@ mod tests {
     use crate::mpk::Position;
 
     const IN_MEMORY: &str = ":memory:";
+    const SECOND_LINE: &str = "b";
     const START: i64 = 1_800_000_000;
     const MINUTE: i64 = 60;
     const HOUR: i64 = 60 * MINUTE;
+    const HALF_HOUR: i64 = 30 * MINUTE;
     const FETCH_SECS: i64 = 10;
     const LATITUDE_E6: i64 = 51_100_000;
     const LONGITUDE_E6: i64 = 17_000_000;
@@ -437,6 +637,8 @@ mod tests {
     const HUNDRED_METERS_PER_FETCH_KMH: f64 = 36.0;
     const SPEED_TOLERANCE_KMH: f64 = 0.1;
     const FLOAT_TOLERANCE: f64 = 1e-9;
+    const DISTANCE_TOLERANCE_M: f64 = 1e-3;
+    const LINE_ID_OFFSET: i64 = 100;
 
     fn point(
         vehicle_type: VehicleType,
@@ -481,6 +683,14 @@ mod tests {
             .collect()
     }
 
+    fn total(buckets: &[Bucket]) -> Bucket {
+        let mut total = Bucket::default();
+        for bucket in buckets {
+            total.add(bucket);
+        }
+        total
+    }
+
     fn sorted(mut points: Vec<TypedPathPoint>) -> Vec<TypedPathPoint> {
         points.sort_by_key(|p| (p.point.line_id, p.point.course_id, p.point.first_seen_unix));
         points
@@ -502,7 +712,7 @@ mod tests {
     fn counts_vehicles_visible_at_each_fetch() {
         let mut points = moving(VehicleType::Bus, 1, START, START + 50, 0);
         points.push(point(VehicleType::Tram, 2, 0, START + 20, START + 50));
-        let [bucket] = compute(&sorted(points), START, START + MINUTE)[..] else {
+        let [bucket] = &compute(&sorted(points), START, START + MINUTE)[..] else {
             panic!("expected one bucket");
         };
 
@@ -523,10 +733,65 @@ mod tests {
         assert!(!bucket.get(TRAIN).has_vehicles());
     }
 
+    fn on_line(line_id: i64, mut p: TypedPathPoint) -> TypedPathPoint {
+        p.point.line_id = line_id;
+        p
+    }
+
+    #[test]
+    fn keeps_totals_per_line() {
+        let first_line = VehicleType::Bus.id();
+        let second_line = first_line + LINE_ID_OFFSET;
+        let mut points = moving(
+            VehicleType::Bus,
+            1,
+            START,
+            START + 50,
+            HUNDRED_METERS_NORTH_E6,
+        );
+        points.extend(
+            moving(VehicleType::Bus, 2, START + 30, START + 50, 0)
+                .into_iter()
+                .map(|p| on_line(second_line, p)),
+        );
+        let [bucket] = &compute(&sorted(points), START, START + MINUTE)[..] else {
+            panic!("expected one bucket");
+        };
+        let first = bucket.totals(Group::Line(first_line));
+        let second = bucket.totals(Group::Line(second_line));
+
+        assert_close(first.average_vehicles(), 1.0, FLOAT_TOLERANCE);
+        assert_close(second.average_vehicles(), 0.5, FLOAT_TOLERANCE);
+        assert_eq!(second.peak_vehicles(), Some(1));
+        assert_close(
+            first.average_speed_kmh(),
+            HUNDRED_METERS_PER_FETCH_KMH,
+            SPEED_TOLERANCE_KMH,
+        );
+        assert_eq!(second.average_speed_kmh(), Some(0.0));
+
+        let bus = bucket.get(BUS);
+        assert_eq!(
+            first.vehicle_samples + second.vehicle_samples,
+            bus.vehicle_samples
+        );
+        assert_eq!(first.travel_secs + second.travel_secs, bus.travel_secs);
+        assert_close(
+            Some(first.distance_m + second.distance_m),
+            bus.distance_m,
+            DISTANCE_TOLERANCE_M,
+        );
+        assert_eq!(bus.peak_vehicles(), Some(2));
+
+        let unknown = bucket.totals(Group::Line(second_line + LINE_ID_OFFSET));
+        assert_eq!(unknown.average_vehicles(), Some(0.0));
+        assert!(!unknown.has_vehicles());
+    }
+
     #[test]
     fn counts_rows_that_started_before_the_window() {
         let points = [point(VehicleType::Tram, 1, 0, START - 100, START + 20)];
-        let [bucket] = compute(&points, START, START + MINUTE)[..] else {
+        let [bucket] = &compute(&points, START, START + MINUTE)[..] else {
             panic!("expected one bucket");
         };
         assert_eq!(bucket.get(TRAM).average_vehicles(), Some(1.0));
@@ -541,7 +806,7 @@ mod tests {
             START + 50,
             HUNDRED_METERS_NORTH_E6,
         );
-        let [bucket] = compute(&points, START, START + MINUTE)[..] else {
+        let [bucket] = &compute(&points, START, START + MINUTE)[..] else {
             panic!("expected one bucket");
         };
         let bus = bucket.get(BUS);
@@ -567,10 +832,7 @@ mod tests {
         );
         points.push(point(VehicleType::Tram, 2, 0, START, START + span_secs));
         points.push(point(VehicleType::Tram, 2, 0, tram_end_unix, tram_end_unix));
-        let total = sum(&bucket_starts(START, START + 11 * MINUTE)
-            .zip(compute(&sorted(points), START, START + 11 * MINUTE))
-            .map(|(start_unix, bucket)| TimedBucket { start_unix, bucket })
-            .collect::<Vec<_>>());
+        let total = total(&compute(&sorted(points), START, START + 11 * MINUTE));
 
         assert_eq!(total.get(TRAM).average_speed_kmh(), Some(0.0));
         assert_close(
@@ -606,14 +868,7 @@ mod tests {
                 START + 100,
             ),
         ];
-        let buckets = compute(&points, START, START + 2 * MINUTE);
-        let total = sum(&buckets
-            .into_iter()
-            .map(|bucket| TimedBucket {
-                start_unix: START,
-                bucket,
-            })
-            .collect::<Vec<_>>());
+        let total = total(&compute(&points, START, START + 2 * MINUTE));
         let bus = total.get(BUS);
         assert_eq!(bus.travel_secs, FETCH_SECS);
         assert_close(
@@ -635,7 +890,7 @@ mod tests {
                 START + 10,
             ),
         ]);
-        let [bucket] = compute(&points, START, START + MINUTE)[..] else {
+        let [bucket] = &compute(&points, START, START + MINUTE)[..] else {
             panic!("expected one bucket");
         };
         assert_eq!(bucket.get(BUS).average_speed_kmh(), None);
@@ -737,7 +992,7 @@ mod tests {
                 START + 20,
             ),
         ];
-        let [bucket] = compute(&points, START, START + MINUTE)[..] else {
+        let [bucket] = &compute(&points, START, START + MINUTE)[..] else {
             panic!("expected one bucket");
         };
         assert_eq!(bucket.get(BUS).travel_secs, 20);
@@ -762,7 +1017,7 @@ mod tests {
                 START + 50,
             ),
         ]);
-        let [bucket, _, _] = compute(&points, START, START + 3 * MINUTE)[..] else {
+        let [bucket, _, _] = &compute(&points, START, START + 3 * MINUTE)[..] else {
             panic!("expected three buckets");
         };
         assert_eq!(bucket.get(TRAM).travel_secs, 50);
@@ -780,12 +1035,44 @@ mod tests {
             .zip(compute(&points, START + MINUTE, START + 4 * MINUTE))
             .map(|(start_unix, bucket)| TimedBucket { start_unix, bucket })
             .collect();
-        let grouped = regroup(&buckets, Duration::from_mins(2));
+        let grouped = regroup(buckets.clone(), Duration::from_mins(2));
         let starts: Vec<i64> = grouped.iter().map(|b| b.start_unix).collect();
         assert_eq!(starts, [START, START + 2 * MINUTE]);
         let samples: Vec<u64> = grouped.iter().map(|b| b.bucket.get(BUS).samples).collect();
         assert_eq!(samples, [6, 6]);
-        assert_eq!(sum(&grouped), sum(&buckets));
+        let unwrap = |timed: Vec<TimedBucket>| -> Vec<Bucket> {
+            timed.into_iter().map(|timed| timed.bucket).collect()
+        };
+        assert_eq!(total(&unwrap(grouped)), total(&unwrap(buckets)));
+    }
+
+    #[test]
+    fn empties_hours_without_vehicles() {
+        let with_vehicles = |vehicles| {
+            let mut totals = Totals::default();
+            totals.add_sample(vehicles);
+            totals.add_step(0.0, FETCH_SECS);
+            totals
+        };
+        let series: Vec<TimedTotals> = [0, 0, 2, 0, 0, 0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, vehicles)| TimedTotals {
+                start_unix: START + i64::try_from(index).unwrap() * HALF_HOUR,
+                totals: with_vehicles(vehicles),
+            })
+            .collect();
+        let hour_start = |unix| align_down(unix - START, HOUR) + START;
+        let counted = skip_idle_hours(&series, hour_start);
+
+        let starts: Vec<i64> = counted.iter().map(|timed| timed.start_unix).collect();
+        let original: Vec<i64> = series.iter().map(|timed| timed.start_unix).collect();
+        assert_eq!(starts, original);
+        let samples: Vec<u64> = counted.iter().map(|timed| timed.totals.samples).collect();
+        assert_eq!(samples, [0, 0, 1, 1, 0, 0]);
+        assert_eq!(sum(&counted).average_vehicles(), Some(1.0));
+        assert_eq!(sum(&series).average_vehicles(), Some(2.0 / 6.0));
+        assert_eq!(skip_idle_hours(&counted, hour_start), counted);
     }
 
     #[test]
@@ -806,10 +1093,10 @@ mod tests {
         }
     }
 
-    fn vehicles_per_minute(buckets: &[TimedBucket], kind: Kind) -> Vec<Option<f64>> {
-        buckets
+    fn vehicles_per_minute(series: &[TimedTotals]) -> Vec<Option<f64>> {
+        series
             .iter()
-            .map(|b| b.bucket.get(kind).average_vehicles())
+            .map(|timed| timed.totals.average_vehicles())
             .collect()
     }
 
@@ -824,19 +1111,24 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let cache = StatsCache::new(BUCKET, Retention::Last(Duration::from_hours(1)));
+        let cache = StatsCache::new(
+            BUCKET,
+            Retention::Last(Duration::from_hours(1)),
+            Detail::Kinds,
+        );
         let now_unix = START + 2 * MINUTE + final_delay_secs();
         let range = (START, START + 3 * MINUTE);
+        let groups = [Group::Kind(TRAM), Group::Kind(BUS)];
         let before = cache
-            .buckets(&db, range.0, range.1, now_unix)
+            .totals(&db, range.0, range.1, now_unix, &groups)
             .await
             .unwrap();
         assert_eq!(
-            vehicles_per_minute(&before, TRAM),
+            vehicles_per_minute(&before[0]),
             [Some(0.0), Some(0.0), Some(0.0)]
         );
         assert_eq!(
-            vehicles_per_minute(&before, BUS),
+            vehicles_per_minute(&before[1]),
             [Some(1.0), Some(1.0), Some(1.0)]
         );
 
@@ -847,11 +1139,64 @@ mod tests {
                 .unwrap();
         }
         let after = cache
-            .buckets(&db, range.0, range.1, now_unix)
+            .totals(&db, range.0, range.1, now_unix, &groups)
             .await
             .unwrap();
-        assert_eq!(after[..2], before[..2]);
-        assert_eq!(vehicles_per_minute(&after, TRAM)[2], Some(0.5));
+        assert_eq!(after[0][..2], before[0][..2]);
+        assert_eq!(vehicles_per_minute(&after[0])[2], Some(0.5));
+    }
+
+    #[tokio::test]
+    async fn serves_line_totals_only_from_caches_that_keep_them() {
+        let db = Db::open(Path::new(IN_MEMORY), OpenMode::CreateIfMissing)
+            .await
+            .unwrap();
+        let first = position(VehicleType::Bus, 1);
+        let second = Position {
+            line: SECOND_LINE.to_owned(),
+            ..position(VehicleType::Bus, 2)
+        };
+        for minute in 0..20 {
+            db.save_positions(START + minute * MINUTE, &[&first, &second], &[])
+                .await
+                .unwrap();
+        }
+        let line_id = |name: &'static str| {
+            let db = db.clone();
+            async move { db.line(VehicleType::Bus, name).await.unwrap().unwrap().id }
+        };
+        let groups = [
+            Group::Kind(BUS),
+            Group::Line(line_id(VehicleType::Bus.as_str()).await),
+            Group::Line(line_id(SECOND_LINE).await),
+        ];
+        let now_unix = START + 24 * HOUR;
+        let window = (START, START + 20 * MINUTE);
+
+        let kinds_only = StatsCache::new(BUCKET, Retention::Forever, Detail::Kinds);
+        assert!(
+            kinds_only
+                .totals(&db, window.0, window.1, now_unix, &groups)
+                .await
+                .is_err()
+        );
+
+        let quarter = Duration::from_mins(15);
+        let with_lines = StatsCache::new(quarter, Retention::Forever, Detail::Lines);
+        let series = with_lines
+            .totals(&db, window.0, window.1, now_unix, &groups)
+            .await
+            .unwrap();
+        let averages: Vec<Option<f64>> = series
+            .iter()
+            .map(|series| sum(series).average_vehicles())
+            .collect();
+        assert_eq!(averages, [Some(2.0), Some(1.0), Some(1.0)]);
+        let cached = with_lines
+            .totals(&db, window.0, window.1, now_unix, &groups)
+            .await
+            .unwrap();
+        assert_eq!(cached, series);
     }
 
     #[tokio::test]
@@ -872,20 +1217,24 @@ mod tests {
             .await
             .unwrap();
 
-        let cache = StatsCache::new(BUCKET, Retention::Last(Duration::from_hours(24)));
-        let to_unix = boundary_unix + 10 * MINUTE;
-        let buckets = cache
-            .buckets(&db, START, to_unix, to_unix + HOUR)
-            .await
-            .unwrap();
-        assert_eq!(
-            sum(&buckets).get(TRAM).travel_secs,
-            10 * MINUTE + FETCH_SECS
+        let cache = StatsCache::new(
+            BUCKET,
+            Retention::Last(Duration::from_hours(24)),
+            Detail::Kinds,
         );
-        let around_boundary: Vec<i64> = buckets
+        let to_unix = boundary_unix + 10 * MINUTE;
+        let [tram_series] = &cache
+            .totals(&db, START, to_unix, to_unix + HOUR, &[Group::Kind(TRAM)])
+            .await
+            .unwrap()[..]
+        else {
+            panic!("expected one series");
+        };
+        assert_eq!(sum(tram_series).travel_secs, 10 * MINUTE + FETCH_SECS);
+        let around_boundary: Vec<i64> = tram_series
             .iter()
             .filter(|b| (boundary_unix - MINUTE..=boundary_unix).contains(&b.start_unix))
-            .map(|b| b.bucket.get(TRAM).travel_secs)
+            .map(|b| b.totals.travel_secs)
             .collect();
         assert_eq!(around_boundary, [MINUTE, MINUTE]);
     }
@@ -902,20 +1251,29 @@ mod tests {
                 .unwrap();
         }
         let quarter = Duration::from_mins(15);
-        let cache = StatsCache::new(quarter, Retention::Forever);
+        let cache = StatsCache::new(quarter, Retention::Forever, Detail::Lines);
         let now_unix = START + 24 * HOUR;
-        let buckets = cache
-            .buckets(&db, START + 1, START + 20 * MINUTE, now_unix)
+        let [bus_series] = &cache
+            .totals(
+                &db,
+                START + 1,
+                START + 20 * MINUTE,
+                now_unix,
+                &[Group::Kind(BUS)],
+            )
             .await
-            .unwrap();
-        let starts: Vec<i64> = buckets.iter().map(|b| b.start_unix).collect();
+            .unwrap()[..]
+        else {
+            panic!("expected one series");
+        };
+        let starts: Vec<i64> = bus_series.iter().map(|b| b.start_unix).collect();
         assert_eq!(starts, [START, START + 15 * MINUTE]);
-        let samples: Vec<u64> = buckets.iter().map(|b| b.bucket.get(BUS).samples).collect();
+        let samples: Vec<u64> = bus_series.iter().map(|b| b.totals.samples).collect();
         assert_eq!(samples, [15, 5]);
 
         let much_later = now_unix + 365 * 24 * HOUR;
         cache
-            .buckets(&db, much_later, much_later + HOUR, much_later)
+            .totals(&db, much_later, much_later + HOUR, much_later, &[])
             .await
             .unwrap();
         assert!(cache.finished.lock().contains_key(&START));
@@ -931,13 +1289,20 @@ mod tests {
             Retention::Last(Duration::from_secs(
                 u64::try_from(final_delay_secs() + 2 * MINUTE).unwrap(),
             )),
+            Detail::Kinds,
         );
         let now_unix = START + 8 * MINUTE + final_delay_secs();
-        let buckets = cache
-            .buckets(&db, START, START + 8 * MINUTE, now_unix)
+        let series = cache
+            .totals(
+                &db,
+                START,
+                START + 8 * MINUTE,
+                now_unix,
+                &[Group::Kind(Kind::All)],
+            )
             .await
             .unwrap();
-        assert_eq!(buckets.len(), 8);
+        assert_eq!(series[0].len(), 8);
         let kept: Vec<i64> = cache.finished.lock().keys().copied().collect();
         assert_eq!(
             kept,

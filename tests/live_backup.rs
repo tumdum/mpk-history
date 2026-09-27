@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use jiff::Timestamp;
 use jiff::civil;
 use jiff::tz::TimeZone;
+use jiff::{RoundMode, Timestamp, Unit, ZonedRound};
 use mpk_history::db::{Db, OpenMode};
 use mpk_history::mpk::VehicleType;
-use mpk_history::stats::{self, Kind, Retention, StatsCache};
+use mpk_history::stats::{self, Detail, Group, Kind, Retention, StatsCache, Totals};
 use mpk_history::web::{self, Clock};
 use scraper::{Html, Selector};
 use sqlx::SqlitePool;
@@ -87,6 +87,9 @@ const STEP_MARGIN_SECS: i64 = MAX_ROW_SPAN_SECS + STEP_GAP_SECS;
 const MAX_PLAUSIBLE_SPEED_KMH: f64 = 120.0;
 const KMH_PER_METER_PER_SECOND: f64 = 3.6;
 const SPEED_TOLERANCE_KMH: f64 = 0.001;
+const LINE_SPEED_TOLERANCE_KMH: f64 = 0.01;
+const LINE_DISTANCE_TOLERANCE: f64 = 1e-5;
+const FLOAT_TOLERANCE: f64 = 1e-9;
 const KIND_ALL: &str = "all";
 const DAY_RANGE: &str = "day";
 const BACKUP_FULL_DAY: (i16, i8, i8) = (2026, 9, 26);
@@ -1104,6 +1107,7 @@ impl ScannedStats {
 
 #[derive(sqlx::FromRow)]
 struct StepRow {
+    line_id: i64,
     vehicle_type: i64,
     lat: i64,
     lon: i64,
@@ -1156,10 +1160,30 @@ impl ScannedStats {
     }
 }
 
-async fn scan_stats(db: &SqlitePool, from_unix: i64, to_unix: i64) -> ScannedStats {
+fn local_hour(unix: i64) -> i64 {
+    Timestamp::from_second(unix)
+        .unwrap()
+        .to_zoned(TimeZone::system())
+        .round(
+            ZonedRound::new()
+                .smallest(Unit::Hour)
+                .mode(RoundMode::Trunc),
+        )
+        .unwrap()
+        .timestamp()
+        .as_second()
+}
+
+async fn scan_stats(
+    db: &SqlitePool,
+    from_unix: i64,
+    to_unix: i64,
+    line_id: Option<i64>,
+) -> ScannedStats {
+    let counted = |row_line_id: i64| line_id.is_none_or(|line_id| line_id == row_line_id);
     let oldest_first_seen_unix = from_unix - STEP_MARGIN_SECS;
-    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
-        "SELECT l.vehicle_type, p.first_seen_unix, p.first_seen_unix + p.seen_for_secs \
+    let rows: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT p.line_id, l.vehicle_type, p.first_seen_unix, p.first_seen_unix + p.seen_for_secs \
          FROM vehicle_positions p JOIN lines l ON l.id = p.line_id \
          WHERE p.first_seen_unix >= ? AND p.first_seen_unix < ?",
     )
@@ -1170,7 +1194,7 @@ async fn scan_stats(db: &SqlitePool, from_unix: i64, to_unix: i64) -> ScannedSta
     .unwrap();
     let all_times: std::collections::BTreeSet<i64> = rows
         .iter()
-        .flat_map(|(_, first, last)| [*first, *last])
+        .flat_map(|(_, _, first, last)| [*first, *last])
         .collect();
     let times: std::collections::BTreeSet<i64> = all_times
         .iter()
@@ -1178,13 +1202,27 @@ async fn scan_stats(db: &SqlitePool, from_unix: i64, to_unix: i64) -> ScannedSta
         .filter(|unix| (from_unix..to_unix).contains(unix))
         .collect();
     let mut visible: HashMap<i64, [u64; VEHICLE_TYPES.len()]> = HashMap::new();
-    for (vehicle_type, first, last) in &rows {
+    for (row_line_id, vehicle_type, first, last) in &rows {
+        if !counted(*row_line_id) {
+            continue;
+        }
         for unix in times.range(*first..=*last) {
             visible.entry(*unix).or_default()[*vehicle_type as usize] += 1;
         }
     }
+    let samples = match line_id {
+        None => times.len(),
+        Some(_) => {
+            let running_hours: HashSet<i64> =
+                visible.keys().map(|unix| local_hour(*unix)).collect();
+            times
+                .iter()
+                .filter(|unix| running_hours.contains(&local_hour(**unix)))
+                .count()
+        }
+    };
     let mut stats = ScannedStats {
-        samples: times.len() as u64,
+        samples: samples as u64,
         ..ScannedStats::default()
     };
     for counts in visible.values() {
@@ -1196,7 +1234,7 @@ async fn scan_stats(db: &SqlitePool, from_unix: i64, to_unix: i64) -> ScannedSta
 
     let window = (from_unix, to_unix);
     let steps: Vec<StepRow> = sqlx::query_as(
-        "SELECT l.vehicle_type, p.latitude_e6 AS lat, p.longitude_e6 AS lon, \
+        "SELECT p.line_id, l.vehicle_type, p.latitude_e6 AS lat, p.longitude_e6 AS lon, \
                 p.first_seen_unix AS first, p.first_seen_unix + p.seen_for_secs AS last, \
                 LEAD(p.latitude_e6) OVER w AS next_lat, LEAD(p.longitude_e6) OVER w AS next_lon, \
                 LEAD(p.first_seen_unix) OVER w AS next_first \
@@ -1209,7 +1247,7 @@ async fn scan_stats(db: &SqlitePool, from_unix: i64, to_unix: i64) -> ScannedSta
     .fetch_all(db)
     .await
     .unwrap();
-    for row in &steps {
+    for row in steps.iter().filter(|row| counted(row.line_id)) {
         let standing = (row.first, row.last);
         match row.step() {
             Some((span, distance_m)) => {
@@ -1257,14 +1295,26 @@ async fn computed_totals(
     resolution: Duration,
     window: (i64, i64),
     now_unix: i64,
-) -> stats::Bucket {
+    groups: &[Group],
+) -> Vec<Totals> {
     let db = Db::open(database, OpenMode::MustExist).await.unwrap();
-    let buckets = StatsCache::new(resolution, Retention::Forever)
-        .buckets(&db, window.0, window.1, now_unix)
+    let series = StatsCache::new(resolution, Retention::Forever, Detail::Lines)
+        .totals(&db, window.0, window.1, now_unix, groups)
         .await
         .unwrap();
     db.close().await;
-    stats::sum(&buckets)
+    series.iter().map(stats::sum).collect()
+}
+
+async fn computed_kind_totals(
+    database: &Path,
+    resolution: Duration,
+    window: (i64, i64),
+    now_unix: i64,
+) -> Vec<(Kind, Totals)> {
+    let groups = Kind::ALL.map(Group::Kind);
+    let totals = computed_totals(database, resolution, window, now_unix, &groups).await;
+    Kind::ALL.into_iter().zip(totals).collect()
 }
 
 async fn last_seen_unix(db: &SqlitePool) -> i64 {
@@ -1290,7 +1340,7 @@ fn single_text(html: &Html, selector: &str) -> String {
 fn assert_matches_scan(
     shown_types: &[usize],
     scanned: &ScannedStats,
-    computed: &stats::Bucket,
+    computed: &[(Kind, Totals)],
     cell: impl Fn(&str, &str) -> String,
 ) {
     let kinds = std::iter::once((KIND_ALL, None))
@@ -1301,10 +1351,12 @@ fn assert_matches_scan(
             format!("{:.1}", scanned.average_vehicles(vehicle_type)),
             "{kind}"
         );
-        let speed = computed
-            .get(stats_kind(vehicle_type))
-            .average_speed_kmh()
+        let computed_kind = stats_kind(vehicle_type);
+        let (_, totals) = computed
+            .iter()
+            .find(|(kind, _)| *kind == computed_kind)
             .unwrap();
+        let speed = totals.average_speed_kmh().unwrap();
         let scanned_speed = scanned.average_speed_kmh(vehicle_type);
         assert!(
             (speed - scanned_speed).abs() <= SPEED_TOLERANCE_KMH,
@@ -1332,9 +1384,9 @@ async fn web_statistics_match_a_scan_of_the_backup() {
     let now_unix = last_seen_unix(&db).await;
     let to_unix = (now_unix + MINUTE_SECS - 1).div_euclid(MINUTE_SECS) * MINUTE_SECS;
     let window = (to_unix - DAY_SECS, to_unix);
-    let scanned = scan_stats(&db, window.0, window.1).await;
+    let scanned = scan_stats(&db, window.0, window.1, None).await;
     let html = web_page(&database.path, "/", now_unix).await;
-    let computed = computed_totals(&database.path, stats::BUCKET, window, now_unix).await;
+    let computed = computed_kind_totals(&database.path, stats::BUCKET, window, now_unix).await;
 
     let shown_types = vehicle_types_seen(&db, to_unix - MONTH_SECS, to_unix).await;
     let expected_tables: Vec<String> = std::iter::once(KIND_ALL)
@@ -1362,16 +1414,13 @@ async fn calendar_day_page_matches_a_scan_of_that_day() {
     let db = open(&database.path).await;
     let now_unix = last_seen_unix(&db).await;
     let first_unix = count(&db, "SELECT MIN(first_seen_unix) FROM vehicle_positions").await;
-    let tz = TimeZone::system();
-    let day = civil::date(BACKUP_FULL_DAY.0, BACKUP_FULL_DAY.1, BACKUP_FULL_DAY.2);
-    let start = |date: civil::Date| date.to_zoned(tz.clone()).unwrap().timestamp().as_second();
-    let window = (start(day), start(day.tomorrow().unwrap()));
+    let (day, window) = backup_full_day_window();
     assert!(
         first_unix < window.0 && window.1 < now_unix,
         "the backup doesn't cover {day}"
     );
-    let scanned = scan_stats(&db, window.0, window.1).await;
-    let computed = computed_totals(&database.path, HISTORY_RESOLUTION, window, now_unix).await;
+    let scanned = scan_stats(&db, window.0, window.1, None).await;
+    let computed = computed_kind_totals(&database.path, HISTORY_RESOLUTION, window, now_unix).await;
     let html = web_page(
         &database.path,
         &format!("/day/{}", day.strftime("%Y-%m-%d")),
@@ -1390,6 +1439,116 @@ async fn calendar_day_page_matches_a_scan_of_that_day() {
             &format!("#period-stats tr[data-metric={metric}] td[data-kind={kind}]"),
         )
     });
+}
+
+fn backup_full_day_window() -> (civil::Date, (i64, i64)) {
+    let tz = TimeZone::system();
+    let day = civil::date(BACKUP_FULL_DAY.0, BACKUP_FULL_DAY.1, BACKUP_FULL_DAY.2);
+    let start = |date: civil::Date| date.to_zoned(tz.clone()).unwrap().timestamp().as_second();
+    (day, (start(day), start(day.tomorrow().unwrap())))
+}
+
+async fn busiest_line_of(db: &SqlitePool, window: (i64, i64)) -> (i64, i64, String) {
+    sqlx::query_as(
+        "SELECT l.id, l.vehicle_type, l.name FROM vehicle_positions p JOIN lines l ON l.id = p.line_id \
+         WHERE p.first_seen_unix >= ? AND p.first_seen_unix < ? \
+         GROUP BY l.id ORDER BY COUNT(*) DESC, l.id LIMIT 1",
+    )
+    .bind(window.0)
+    .bind(window.1)
+    .fetch_one(db)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn line_day_page_matches_a_scan_of_that_line() {
+    let database = TestDatabase::migrated_backup();
+    let db = open(&database.path).await;
+    let now_unix = last_seen_unix(&db).await;
+    let (day, window) = backup_full_day_window();
+    let (line_id, vehicle_type, name) = busiest_line_of(&db, window).await;
+    let type_slug = VEHICLE_TYPES[vehicle_type as usize];
+    let scanned = scan_stats(&db, window.0, window.1, Some(line_id)).await;
+    let [computed] = &computed_totals(
+        &database.path,
+        HISTORY_RESOLUTION,
+        window,
+        now_unix,
+        &[Group::Line(line_id)],
+    )
+    .await[..] else {
+        panic!("expected one line total");
+    };
+    let path = format!("/{type_slug}/{name}/day/{}", day.strftime("%Y-%m-%d"));
+    let html = web_page(&database.path, &path, now_unix).await;
+    let cell = |metric: &str| {
+        single_text(
+            &html,
+            &format!("#period-stats tr[data-metric={metric}] td[data-kind={type_slug}-{name}]"),
+        )
+    };
+
+    assert_eq!(
+        cell("average-vehicles"),
+        format!(
+            "{:.1}",
+            scanned.average_vehicles(Some(vehicle_type as usize))
+        )
+    );
+    assert_eq!(cell("peak-vehicles"), scanned.peak_vehicles.to_string());
+    let speed = computed.average_speed_kmh().unwrap();
+    let scanned_speed = scanned.average_speed_kmh(Some(vehicle_type as usize));
+    assert!(
+        (speed - scanned_speed).abs() <= LINE_SPEED_TOLERANCE_KMH,
+        "computed {speed:.3} km/h, scan gives {scanned_speed:.3} km/h"
+    );
+    assert_eq!(cell("average-speed"), format!("{speed:.1}"));
+    assert!(MEDIAN_SPEED_KMH.contains(&speed), "{speed} km/h");
+}
+
+#[tokio::test]
+async fn line_totals_add_up_to_their_vehicle_type() {
+    let database = TestDatabase::migrated_backup();
+    let db = open(&database.path).await;
+    let now_unix = last_seen_unix(&db).await;
+    let (_, window) = backup_full_day_window();
+    let lines: Vec<(i64, i64)> = sqlx::query_as("SELECT id, vehicle_type FROM lines ORDER BY id")
+        .fetch_all(&db)
+        .await
+        .unwrap();
+    for vehicle_type in VehicleType::ALL {
+        let mut groups = vec![Group::Kind(Kind::Vehicle(vehicle_type))];
+        groups.extend(
+            lines
+                .iter()
+                .filter(|(_, line_type)| *line_type == vehicle_type.id())
+                .map(|(id, _)| Group::Line(*id)),
+        );
+        let totals = computed_totals(
+            &database.path,
+            HISTORY_RESOLUTION,
+            window,
+            now_unix,
+            &groups,
+        )
+        .await;
+        let (type_totals, line_totals) = totals.split_first().unwrap();
+        let summed = |value: fn(&Totals) -> Option<f64>| -> f64 {
+            line_totals.iter().filter_map(value).sum()
+        };
+        let type_vehicles = type_totals.average_vehicles().unwrap();
+        assert!(
+            (summed(Totals::average_vehicles) - type_vehicles).abs() <= FLOAT_TOLERANCE,
+            "{vehicle_type:?}"
+        );
+        let type_km = type_totals.distance_km().unwrap();
+        assert!(
+            (summed(Totals::distance_km) - type_km).abs() <= type_km * LINE_DISTANCE_TOLERANCE,
+            "{vehicle_type:?}: lines {} km, type {type_km} km",
+            summed(Totals::distance_km)
+        );
+    }
 }
 
 struct RunningServer(Child);

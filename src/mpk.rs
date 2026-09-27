@@ -10,7 +10,7 @@ const MAP_PAGE_URL: &str =
     "https://mpk.wroc.pl/strefa-pasazera/zaplanuj-podroz/mapa-pozycji-pojazdow";
 const POSITIONS_URL: &str = "https://mpk.wroc.pl/bus_position";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VehicleType {
     Bus = 0,

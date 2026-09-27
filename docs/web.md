@@ -35,6 +35,44 @@ An unknown `range` gives `400`, an unknown chart `404`. A period in any other fo
 like `/day/2026-9-27` or `/week/2026-W54`, gives `404`. Charts are drawn on the server
 with `plotters`.
 
+Chart colors are chosen so that every pair of lines in a chart stays apart for the
+common kinds of color blindness, since any two lines can cross. The vehicle charts use
+blue (all vehicles), orange (buses), aqua (trams) and violet (trains); the download
+chart uses magenta, green, violet and yellow. Both sets were checked with a palette
+validator (OKLab distance of at least 8 under simulated protanopia, deuteranopia and
+tritanopia, and at least 15 with normal vision). plotters' own palettes don't pass: their
+yellow and pink are too light on the white chart. Swapping a color means checking the
+whole set again. Every chart with two or more lines also has a legend, and hovering
+names each value, so color is never the only cue.
+
+## Vehicles and lines
+
+Every statistics page and chart above can be limited to one vehicle type or one line
+by putting it in front of the path:
+
+| Prefix | Counts | Examples |
+|---|---|---|
+| none | all vehicles | `/`, `/week/2026-W39` |
+| `/bus`, `/tram`, `/train` | all vehicles of that type | `/tram?range=week`, `/bus/day/2026-09-26` |
+| `/bus/136`, `/tram/74`, … | one line | `/bus/136?range=week`, `/bus/136/month/2027-05` |
+
+The line is the name from the MPK feed, under its vehicle type, so a bus and a tram
+with the same name are two lines. A line that is not in the `lines` table gives `404`.
+A known line with nothing in the period shows `–`. Data quality pages take the same
+prefixes (see [Data quality](#data-quality)).
+
+Each page has a "Vehicles" row with links to all vehicles and each vehicle type, and a
+"Lines" section with the lines seen in the page's time range (the last month on the
+overview). The links keep the current period or chart range, so from
+`/bus/136/week/2026-W39` "Trams" goes to `/tram/week/2026-W39`. Pages of a type or a
+line have one table and one line per chart.
+
+For a line, every clock hour (local time) in which none of its vehicles was seen is
+left out: its fetch times don't count, so the average active vehicles is the mean over
+the hours the line ran, and a line that runs only at night isn't averaged down by the
+day. Charts of a line have gaps in those hours. Vehicle types and all vehicles count
+every fetch time.
+
 ## Calendar pages
 
 Days, weeks, months and years start at local midnight in the server's time zone, so a
@@ -56,16 +94,22 @@ month, and this year. A period that hasn't ended yet says "So far".
 ## Data quality
 
 Data quality has its own pages: `/quality` for the last hour, day, week and month, and
-`<period>/quality` for each calendar page. The statistics pages link to them with
-"Data quality", and back with "Statistics of this …". Each has two tables and a chart
-for each:
+`<period>/quality` for each calendar page. Both take the vehicle type and line prefixes
+of the statistics pages, like `/bus/136/quality` or `/tram/week/2026-W39/quality`. The
+statistics pages link to them with "Data quality", and back with "Statistics of this …".
+Each has two tables and a chart for each:
 
 - **Failed downloads:** for each source (MPK positions, MPK line list, Open-Meteo,
   open data fleet), the share of downloads that failed. Any failure that gets a
   `fetch_errors` row counts: timeouts, connection errors, HTTP errors and answers that
   can't be read.
-- **Invalid GPS positions:** for all vehicles and each vehicle type, the share of
-  positions in the MPK feed with coordinates the collector threw away.
+- **Invalid GPS positions:** for all vehicles and each vehicle type (or only the
+  selected type or line), the share of positions in the MPK feed with coordinates the
+  collector threw away.
+
+Pages of a vehicle type or a line show only invalid GPS positions. Failed downloads
+are left out there: one MPK download has the positions of all lines, so a failure is
+never about one line or type.
 
 Only percentages are shown, never the counts. Shares under 0.1% show as `<0.1%`, so a
 few failures don't look like none. The charts have one line per source or vehicle type
@@ -75,7 +119,8 @@ Open-Meteo every 30 minutes, show as separate dots on the shorter steps.
 
 The numbers come from `fetch_attempts` and `position_counts` (see
 [database.md](database.md#fetch_attempts)), which the collector fills since migration
-`0014`. Periods before that, or when a collector was disabled, show `–`.
+`0014`, and for lines from `line_position_counts`, filled since migration `0015`.
+Periods before that, or when a collector was disabled, show `–`.
 
 ## Hovering the charts
 
@@ -134,21 +179,30 @@ The server keeps totals in memory in two caches:
 
 | Cache | Resolution | Keeps | Used by |
 |---|---|---|---|
-| Recent | 1 minute | the last 30 days | the overview |
-| History | 15 minutes | everything, about 6 MB per year of data | calendar pages |
+| Recent | 1 minute | the last 30 days, totals per vehicle type only | the overview |
+| Recent lines | 1 minute | the last day, also totals per line | the last hour and day of a line |
+| History | 15 minutes | everything, also totals per line: about 60 MB per year of data | calendar pages; the last week and month of a line |
+
+Totals per line are what takes the memory: about 65 lines run at a time, and each
+keeps 24 bytes per bucket. To keep this small, a line's last week and last month come
+from the history cache, so they start at the quarter hour before the exact time. For
+all vehicles and vehicle types they start at the minute.
 
 A step can reach up to 11 minutes back, so a bucket is kept once it ended at least 12
 minutes ago; later buckets are computed again on each request. At start the server
-computes the last 30 days and then all history in the background, in 6-hour chunks.
-Each chunk is one query on the shared connection, so the collector waits at most for
-one chunk. A year of data takes a few minutes; until it is done, a calendar page
-waits for it. Nothing is stored in the database, so this happens after every restart.
+computes the last 30 days, the last day with lines, and then all history in the
+background, in 6-hour chunks. Each chunk is one query on the shared connection, so the
+collector waits at most for one chunk. A year of data takes a few minutes; until it is
+done, calendar pages and the last week and month of a line wait for it. Nothing is
+stored in the database, so this happens after every restart.
 
 ## Tests
 
-- `src/stats.rs`, `src/charts.rs`, `src/web.rs`: unit tests with small made-up data.
-- `tests/live_backup.rs`: the overview's last-day values and a calendar day page both
-  match a separate scan of the test backup, and a real `collect` run with MPK
+- `src/stats.rs`, `src/charts.rs`, `src/web.rs`, `src/web/selection.rs`: unit tests
+  with small made-up data.
+- `tests/live_backup.rs`: the overview's last-day values, a calendar day page and the
+  day page of the busiest line all match a separate scan of the test backup, the
+  lines' totals add up to their vehicle type's, and a real `collect` run with MPK
   unreachable shows 100% failed line-list downloads. `collect` serves the page and stops on `SIGTERM`, and `--web disabled`
   doesn't listen. These tests send MPK requests to a closed local proxy port, so they
   don't reach the internet.

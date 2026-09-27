@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use jiff::tz::TimeZone;
 use jiff::{RoundMode, Timestamp, Unit, Zoned, ZonedRound};
-use mpk_history::db::{self, Db, OpenMode, PositionCount};
+use mpk_history::db::{self, Db, LinePositionCount, OpenMode};
 use mpk_history::fetch::{self, Source};
 use mpk_history::geo::MicroDegrees;
 use mpk_history::mpk::{Position, VehicleType};
@@ -192,8 +192,9 @@ async fn record_quality_counts(db: &Db) {
             .await
             .unwrap();
     }
-    let invalid_buses = PositionCount {
+    let invalid_buses = LinePositionCount {
         vehicle_type: VehicleType::Bus,
+        line: "a".to_owned(),
         received: 20,
         invalid: 1,
     };
@@ -260,7 +261,7 @@ async fn text(driver: &WebDriver, selector: &str) -> WebDriverResult<String> {
 
 async fn selected_range(driver: &WebDriver) -> WebDriverResult<String> {
     driver
-        .find(By::Css("nav a[aria-current=page]"))
+        .find(By::Css("#charts nav a[aria-current=page]"))
         .await?
         .text()
         .await
@@ -725,6 +726,95 @@ async fn calendar_pages_show_statistics_of_their_period() {
             driver.find(By::Id("next")).await?.attr("href").await?,
             Some(day_path)
         );
+        Ok(())
+    })
+    .await;
+}
+
+async fn click(driver: &WebDriver, selector: &str) -> WebDriverResult<()> {
+    driver.find(By::Css(selector)).await?.click().await
+}
+
+async fn heading(driver: &WebDriver) -> WebDriverResult<String> {
+    driver.find(By::Tag("h1")).await?.text().await
+}
+
+#[tokio::test]
+async fn vehicle_and_line_links_switch_what_is_counted() {
+    in_browser(|driver, url| async move {
+        driver.goto(format!("{url}/?range=week")).await?;
+        click(&driver, "#vehicles a[href='/bus?range=week']").await?;
+        assert_eq!(current_path(&driver).await?, "/bus");
+        assert_eq!(heading(&driver).await?, "Buses");
+        assert_eq!(selected_range(&driver).await?, "Last week");
+        assert_eq!(
+            texts(driver.find_all(By::Css("#lines a")).await?).await?,
+            ["a", "b"]
+        );
+
+        click(&driver, "#lines a[href='/bus/a?range=week']").await?;
+        assert_eq!(current_path(&driver).await?, "/bus/a");
+        assert_eq!(heading(&driver).await?, "Bus a");
+        assert_eq!(selected_range(&driver).await?, "Last week");
+        assert_eq!(
+            text(
+                &driver,
+                "#stats-bus-a tr[data-metric=average-speed] td[data-range=week]"
+            )
+            .await?,
+            "36.0"
+        );
+
+        driver
+            .find(By::LinkText("This week"))
+            .await?
+            .click()
+            .await?;
+        let week = local(NOW).iso_week_date();
+        let week_path = format!("/week/{:04}-W{:02}", week.year(), week.week());
+        assert_eq!(current_path(&driver).await?, format!("/bus/a{week_path}"));
+        assert_eq!(
+            heading(&driver).await?,
+            format!("Bus a: Week {}, {}", week.week(), week.year())
+        );
+        assert_eq!(
+            period_cell(&driver, "bus-a", "average-speed").await?,
+            "36.0"
+        );
+        assert_eq!(
+            period_cell(&driver, "bus-a", "average-vehicles").await?,
+            "1.0"
+        );
+        let (_, shown, _) = hover_step_at(
+            &driver,
+            "average-vehicles",
+            step_count(&driver, "average-vehicles").await? - 1,
+        )
+        .await?;
+        assert_eq!(shown.rows, rows(&[("Bus a", "1.0")]));
+
+        driver.find(By::Id("quality-link")).await?.click().await?;
+        assert_eq!(
+            current_path(&driver).await?,
+            format!("/bus/a{week_path}/quality")
+        );
+        assert_eq!(
+            text(&driver, "#invalid-positions tr[data-kind=bus-a] td").await?,
+            "5.0%"
+        );
+        driver
+            .find(By::Id("statistics-link"))
+            .await?
+            .click()
+            .await?;
+        assert_eq!(current_path(&driver).await?, format!("/bus/a{week_path}"));
+
+        click(&driver, &format!("#vehicles a[href='/tram{week_path}']")).await?;
+        assert_eq!(current_path(&driver).await?, format!("/tram{week_path}"));
+        assert_eq!(period_cell(&driver, "tram", "average-speed").await?, "0.0");
+        click(&driver, &format!("#vehicles a[href='{week_path}']")).await?;
+        assert_eq!(current_path(&driver).await?, week_path);
+        assert_eq!(period_cell(&driver, "bus", "average-speed").await?, "27.0");
         Ok(())
     })
     .await;

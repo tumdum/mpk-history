@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tracing::{debug, info, warn};
 
-use crate::db::{self, Db, PositionCount};
+use crate::db::{self, Db, LinePositionCount};
 use crate::fetch::Source;
 use crate::fetch_errors;
 use crate::geo::{self, MicroDegrees};
@@ -131,22 +131,27 @@ impl Tracker {
     }
 }
 
-fn position_counts(positions: &[Position]) -> Vec<PositionCount> {
-    VehicleType::ALL
+fn position_counts(positions: &[Position]) -> Vec<LinePositionCount> {
+    let mut counts: BTreeMap<(VehicleType, &str), (i64, i64)> = BTreeMap::new();
+    for position in positions {
+        let (received, invalid) = counts
+            .entry((position.vehicle_type, position.line.as_str()))
+            .or_default();
+        *received += 1;
+        if !position.has_valid_coordinates() {
+            *invalid += 1;
+        }
+    }
+    counts
         .into_iter()
-        .filter_map(|vehicle_type| {
-            let of_type = positions.iter().filter(|p| p.vehicle_type == vehicle_type);
-            let received = of_type.clone().count();
-            if received == 0 {
-                return None;
-            }
-            let invalid = of_type.filter(|p| !p.has_valid_coordinates()).count();
-            Some(PositionCount {
+        .map(
+            |((vehicle_type, line), (received, invalid))| LinePositionCount {
                 vehicle_type,
-                received: i64::try_from(received).unwrap_or(i64::MAX),
-                invalid: i64::try_from(invalid).unwrap_or(i64::MAX),
-            })
-        })
+                line: line.to_owned(),
+                received,
+                invalid,
+            },
+        )
         .collect()
 }
 
@@ -278,28 +283,30 @@ mod tests {
     }
 
     #[test]
-    fn counts_received_and_invalid_positions_per_type() {
+    fn counts_received_and_invalid_positions_per_line() {
         let mut tram = position(3, 51.1, 17.0);
         tram.vehicle_type = VehicleType::Tram;
+        let mut other_bus_line = position(5, 0.0, 0.0);
+        other_bus_line.line = "a".to_owned();
         let positions = [
             position(1, 51.0, 17.0),
             position(2, 0.0, 0.0),
+            other_bus_line,
             position(4, 91.0, 17.0),
             tram,
         ];
+        let count = |vehicle_type, line: &str, received, invalid| LinePositionCount {
+            vehicle_type,
+            line: line.to_owned(),
+            received,
+            invalid,
+        };
         assert_eq!(
             position_counts(&positions),
             [
-                PositionCount {
-                    vehicle_type: VehicleType::Bus,
-                    received: 3,
-                    invalid: 2
-                },
-                PositionCount {
-                    vehicle_type: VehicleType::Tram,
-                    received: 1,
-                    invalid: 0
-                },
+                count(VehicleType::Bus, "133", 3, 2),
+                count(VehicleType::Bus, "a", 1, 1),
+                count(VehicleType::Tram, "133", 1, 0),
             ]
         );
         assert!(position_counts(&[]).is_empty());

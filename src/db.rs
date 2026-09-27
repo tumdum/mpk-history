@@ -24,6 +24,13 @@ pub enum OpenMode {
     ExistingAsIs,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredLine {
+    pub id: i64,
+    pub vehicle_type: VehicleType,
+    pub name: String,
+}
+
 #[derive(Debug)]
 pub struct StoredPosition {
     pub line_id: i64,
@@ -56,6 +63,14 @@ pub struct FetchCount {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PositionCount {
     pub vehicle_type: VehicleType,
+    pub received: i64,
+    pub invalid: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinePositionCount {
+    pub vehicle_type: VehicleType,
+    pub line: String,
     pub received: i64,
     pub invalid: i64,
 }
@@ -295,11 +310,29 @@ impl Db {
         seen_at_unix: i64,
         new: &[&Position],
         seen_again: &[i64],
-        counts: &[PositionCount],
+        counts: &[LinePositionCount],
     ) -> Result<Vec<i64>> {
         let mut tx = self.pool.begin().await?;
         let minute_unix = count_bucket_start(seen_at_unix);
+        let mut added_lines = HashMap::new();
         for count in counts {
+            let line_id = self
+                .line_id(&mut tx, count.vehicle_type, &count.line, &mut added_lines)
+                .await?;
+            sqlx::query(
+                "INSERT INTO line_position_counts (line_id, minute_unix, received, invalid) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT (line_id, minute_unix) DO UPDATE \
+                 SET received = received + excluded.received, invalid = invalid + excluded.invalid",
+            )
+            .bind(line_id)
+            .bind(minute_unix)
+            .bind(count.received)
+            .bind(count.invalid)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for count in per_type(counts) {
             sqlx::query(
                 "INSERT INTO position_counts (vehicle_type, minute_unix, received, invalid) \
                  VALUES (?, ?, ?, ?) \
@@ -322,10 +355,16 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         }
-        let mut added_lines = HashMap::new();
         let mut new_ids = Vec::with_capacity(new.len());
         for position in new {
-            let line_id = self.line_id(&mut tx, position, &mut added_lines).await?;
+            let line_id = self
+                .line_id(
+                    &mut tx,
+                    position.vehicle_type,
+                    &position.line,
+                    &mut added_lines,
+                )
+                .await?;
             let row_id = sqlx::query(
                 "INSERT INTO vehicle_positions \
                  (line_id, course_id, latitude_e6, longitude_e6, first_seen_unix, seen_for_secs) \
@@ -349,23 +388,24 @@ impl Db {
     async fn line_id(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
-        position: &Position,
+        vehicle_type: VehicleType,
+        name: &str,
         added_lines: &mut HashMap<LineKey, i64>,
     ) -> Result<i64> {
-        let key = (position.vehicle_type, position.line.clone());
+        let key = (vehicle_type, name.to_owned());
         let cached = self.line_ids.lock().get(&key).copied();
         if let Some(line_id) = cached.or_else(|| added_lines.get(&key).copied()) {
             return Ok(line_id);
         }
         sqlx::query("INSERT OR IGNORE INTO lines (vehicle_type, name) VALUES (?, ?)")
-            .bind(position.vehicle_type.id())
-            .bind(&position.line)
+            .bind(vehicle_type.id())
+            .bind(name)
             .execute(&mut **tx)
             .await?;
         let (line_id,): (i64,) =
             sqlx::query_as("SELECT id FROM lines WHERE vehicle_type = ? AND name = ?")
-                .bind(position.vehicle_type.id())
-                .bind(&position.line)
+                .bind(vehicle_type.id())
+                .bind(name)
                 .fetch_one(&mut **tx)
                 .await?;
         added_lines.insert(key, line_id);
@@ -553,6 +593,63 @@ impl Db {
             .collect()
     }
 
+    pub async fn line_position_counts(
+        &self,
+        line: &StoredLine,
+        from_unix: i64,
+        to_unix: i64,
+    ) -> Result<Vec<PositionCount>> {
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT SUM(received), SUM(invalid) FROM line_position_counts \
+             WHERE line_id = ?1 AND minute_unix >= ?2 AND minute_unix < ?3 \
+             GROUP BY line_id",
+        )
+        .bind(line.id)
+        .bind(from_unix)
+        .bind(to_unix)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(received, invalid)| PositionCount {
+                vehicle_type: line.vehicle_type,
+                received,
+                invalid,
+            })
+            .collect())
+    }
+
+    pub async fn line_position_counts_by_minute(
+        &self,
+        line: &StoredLine,
+        from_unix: i64,
+        to_unix: i64,
+    ) -> Result<Vec<(i64, PositionCount)>> {
+        let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT minute_unix, received, invalid FROM line_position_counts \
+             WHERE line_id = ?1 AND minute_unix >= ?2 AND minute_unix < ?3 \
+             ORDER BY minute_unix",
+        )
+        .bind(line.id)
+        .bind(from_unix)
+        .bind(to_unix)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(minute_unix, received, invalid)| {
+                (
+                    minute_unix,
+                    PositionCount {
+                        vehicle_type: line.vehicle_type,
+                        received,
+                        invalid,
+                    },
+                )
+            })
+            .collect())
+    }
+
     pub async fn positions_at(
         &self,
         filter: PositionFilter<'_>,
@@ -688,6 +785,46 @@ impl Db {
         .fetch_one(&self.pool)
         .await?;
         Ok(first)
+    }
+
+    pub async fn line(&self, vehicle_type: VehicleType, name: &str) -> Result<Option<StoredLine>> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM lines WHERE vehicle_type = ? AND name = ?")
+                .bind(vehicle_type.id())
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(id,)| StoredLine {
+            id,
+            vehicle_type,
+            name: name.to_owned(),
+        }))
+    }
+
+    pub async fn lines_seen_between(
+        &self,
+        from_unix: i64,
+        to_unix: i64,
+    ) -> Result<Vec<StoredLine>> {
+        let rows: Vec<(i64, i64, String)> = sqlx::query_as(
+            "SELECT l.id, l.vehicle_type, l.name FROM lines l \
+             WHERE EXISTS (SELECT 1 FROM vehicle_positions p \
+                           WHERE p.line_id = l.id AND p.first_seen_unix >= ?1 AND p.first_seen_unix < ?2) \
+             ORDER BY l.vehicle_type, l.name",
+        )
+        .bind(from_unix)
+        .bind(to_unix)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(id, vehicle_type, name)| {
+                Ok(StoredLine {
+                    id,
+                    vehicle_type: vehicle_type.try_into()?,
+                    name,
+                })
+            })
+            .collect()
     }
 
     pub async fn positions_active_at(
@@ -937,6 +1074,25 @@ async fn insert_fetch_error(conn: &mut SqliteConnection, error: &FetchError) -> 
     Ok(())
 }
 
+fn per_type(counts: &[LinePositionCount]) -> Vec<PositionCount> {
+    VehicleType::ALL
+        .into_iter()
+        .filter_map(|vehicle_type| {
+            let of_type = counts
+                .iter()
+                .filter(|count| count.vehicle_type == vehicle_type);
+            let (received, invalid) = of_type.fold((0, 0), |(received, invalid), count| {
+                (received + count.received, invalid + count.invalid)
+            });
+            (received > 0).then_some(PositionCount {
+                vehicle_type,
+                received,
+                invalid,
+            })
+        })
+        .collect()
+}
+
 fn count_bucket_start(unix: i64) -> i64 {
     let bucket_secs = duration_secs(COUNT_BUCKET);
     unix.div_euclid(bucket_secs) * bucket_secs
@@ -1154,6 +1310,29 @@ mod tests {
             .unwrap();
         assert_eq!(summary(&trams), [(VehicleType::Tram, "1", 2, 100, 100)]);
         assert_eq!(line_count(&db).await, 2);
+    }
+
+    #[tokio::test]
+    async fn finds_lines_by_name_and_by_time_seen() {
+        let db = open().await;
+        let bus = position(VehicleType::Bus, "a", 1);
+        let tram = position(VehicleType::Tram, "a", 2);
+        db.save_positions(100, &[&bus], &[]).await.unwrap();
+        db.save_positions(200, &[&tram], &[]).await.unwrap();
+
+        let bus_line = db.line(VehicleType::Bus, "a").await.unwrap().unwrap();
+        let tram_line = db.line(VehicleType::Tram, "a").await.unwrap().unwrap();
+        assert_ne!(bus_line.id, tram_line.id);
+        assert_eq!(bus_line.name, "a");
+        assert_eq!(db.line(VehicleType::Train, "a").await.unwrap(), None);
+        assert_eq!(db.line(VehicleType::Bus, "b").await.unwrap(), None);
+
+        assert_eq!(
+            db.lines_seen_between(0, 1000).await.unwrap(),
+            [bus_line.clone(), tram_line.clone()]
+        );
+        assert_eq!(db.lines_seen_between(150, 1000).await.unwrap(), [tram_line]);
+        assert_eq!(db.lines_seen_between(0, 100).await.unwrap(), []);
     }
 
     #[tokio::test]
@@ -1608,24 +1787,41 @@ mod tests {
             received,
             invalid,
         };
+        let line_count_of = |vehicle_type, line: &str, received, invalid| LinePositionCount {
+            vehicle_type,
+            line: line.to_owned(),
+            received,
+            invalid,
+        };
         let minute = 1_800_000_000;
         db.save_positions_with_counts(
             minute,
             &[&bus],
             &[],
             &[
-                count(VehicleType::Bus, 3, 1),
-                count(VehicleType::Tram, 2, 0),
+                line_count_of(VehicleType::Bus, "a", 2, 1),
+                line_count_of(VehicleType::Bus, "b", 1, 0),
+                line_count_of(VehicleType::Tram, "1", 2, 0),
             ],
         )
         .await
         .unwrap();
-        db.save_positions_with_counts(minute + 10, &[], &[], &[count(VehicleType::Bus, 4, 2)])
-            .await
-            .unwrap();
-        db.save_positions_with_counts(minute + 60, &[], &[], &[count(VehicleType::Bus, 1, 1)])
-            .await
-            .unwrap();
+        db.save_positions_with_counts(
+            minute + 10,
+            &[],
+            &[],
+            &[line_count_of(VehicleType::Bus, "a", 4, 2)],
+        )
+        .await
+        .unwrap();
+        db.save_positions_with_counts(
+            minute + 60,
+            &[],
+            &[],
+            &[line_count_of(VehicleType::Bus, "a", 1, 1)],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             db.position_counts(minute, minute + 60).await.unwrap(),
@@ -1651,7 +1847,31 @@ mod tests {
                 (minute + 60, count(VehicleType::Bus, 1, 1)),
             ]
         );
-        assert_eq!(line_count(&db).await, 1);
+
+        let line_a = db.line(VehicleType::Bus, "a").await.unwrap().unwrap();
+        let line_b = db.line(VehicleType::Bus, "b").await.unwrap().unwrap();
+        assert_eq!(
+            db.line_position_counts(&line_a, minute, minute + 120)
+                .await
+                .unwrap(),
+            [count(VehicleType::Bus, 7, 4)]
+        );
+        assert_eq!(
+            db.line_position_counts(&line_b, minute + 60, minute + 120)
+                .await
+                .unwrap(),
+            []
+        );
+        assert_eq!(
+            db.line_position_counts_by_minute(&line_a, minute, minute + 120)
+                .await
+                .unwrap(),
+            [
+                (minute, count(VehicleType::Bus, 6, 3)),
+                (minute + 60, count(VehicleType::Bus, 1, 1)),
+            ]
+        );
+        assert_eq!(line_count(&db).await, 3);
     }
 
     #[tokio::test]

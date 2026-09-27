@@ -54,6 +54,7 @@ integers:
 erDiagram
     lines ||--o{ vehicle_positions : "line_id"
     lines ||--o{ course_vehicles : "line_id"
+    lines ||--o{ line_position_counts : "line_id"
     vehicle_positions }o..o{ course_vehicles : "line_id + course_id (no foreign key)"
     lines {
         INTEGER id PK
@@ -97,6 +98,12 @@ erDiagram
     }
     position_counts {
         INTEGER vehicle_type PK
+        INTEGER minute_unix PK
+        INTEGER received
+        INTEGER invalid
+    }
+    line_position_counts {
+        INTEGER line_id PK
         INTEGER minute_unix PK
         INTEGER received
         INTEGER invalid
@@ -258,6 +265,22 @@ minute have no row.
 
 Primary key: `(vehicle_type, minute_unix)`, without a rowid.
 
+### `line_position_counts`
+
+The same counts per line, saved in the same transaction. `position_counts` holds their
+sums per vehicle type, so the type pages keep working for the time before this table.
+A line seen only with invalid coordinates still gets a `lines` row. About 70 lines are
+in the feed each minute, so this adds about 100 000 rows, 1.5–2 MB, per day.
+
+| Column | Meaning |
+|---|---|
+| `line_id` | `lines.id` |
+| `minute_unix` | Start of the minute of the fetch |
+| `received` | Positions of the line in the feed |
+| `invalid` | Of those, positions with invalid coordinates |
+
+Primary key: `(line_id, minute_unix)`, without a rowid.
+
 ### `fetch_errors`
 
 One row per failed download from any external source. The collector saves the row and
@@ -302,7 +325,7 @@ Index: `fetch_errors_source_started (source, started_unix)`.
 | Tracker updates | `vehicle_positions` primary key |
 | Line lookup by name | `lines_name` |
 | `bbox` | none, it reads the whole table. This is fine for an occasional command |
-| Data quality on the web page | `fetch_attempts` and `position_counts` primary keys |
+| Data quality on the web page | `fetch_attempts`, `position_counts` and `line_position_counts` primary keys |
 
 ## Size
 
@@ -335,6 +358,7 @@ GROUP BY day;
 | `0012_inferred_course_vehicles` | `source` and `inferred_from_course_id` | |
 | `0013_fetch_errors` | Failed downloads table | |
 | `0014_quality_counts` | `fetch_attempts` and `position_counts` | |
+| `0015_line_position_counts` | `line_position_counts` | |
 
 Before starting a new binary whose new migrations **rebuild a table**, stop the
 running collector. An old collector writing into a rebuilt table fails on every fetch.
