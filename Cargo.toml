@@ -17,6 +17,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+criterion = { version = "0.8.2", features = ["async_tokio"] }
 liblzma = { version = "0.4.8", features = ["static"] }
 rstest = { version = "0.27.0", default-features = false }
 serde_json = "1.0.151"
@@ -30,3 +31,7 @@ debug = "full"
 
 [build-dependencies]
 built = { version = "0.8.1", features = ["git2"] }
+
+[[bench]]
+name = "backup"
+harness = false

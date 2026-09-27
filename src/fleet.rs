@@ -12,8 +12,8 @@ use crate::inference::{self, InferenceSettings};
 use crate::open_data::{Client, VehicleRecord};
 
 const MATCH_RADIUS_M: f64 = 20.0;
-const TIME_SLACK: Duration = Duration::from_secs(30);
-const INFERENCE_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
+pub const TIME_SLACK: Duration = Duration::from_secs(30);
+pub const INFERENCE_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Debug, PartialEq)]
 enum Outcome {

@@ -16,7 +16,7 @@ const UNKNOWN_FLEET_VALUE: &str = "-";
 const FLEET_VALUE_SEPARATOR: &str = "/";
 const UNKNOWN_SPEED: &str = "-";
 const INFERRED_MARKER: &str = "*";
-const SPEED_WINDOW: Duration = Duration::from_secs(60);
+pub const SPEED_WINDOW: Duration = Duration::from_secs(60);
 
 pub fn parse_time(input: &str) -> Result<Timestamp> {
     if let Ok(timestamp) = input.parse::<Timestamp>() {

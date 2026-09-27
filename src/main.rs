@@ -1,19 +1,3 @@
-mod backup;
-mod build_info;
-mod collector;
-mod db;
-mod fetch;
-mod fetch_errors;
-mod fleet;
-mod geo;
-mod inference;
-mod mpk;
-mod open_data;
-mod open_meteo;
-mod query;
-mod speed;
-mod weather;
-
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -26,12 +10,13 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::collector::VehicleCollector;
-use crate::db::{Db, OpenMode};
-use crate::fleet::FleetCollector;
-use crate::inference::InferenceSettings;
-use crate::open_meteo::Area;
-use crate::weather::WeatherCollector;
+use mpk_history::collector::VehicleCollector;
+use mpk_history::db::{Db, OpenMode};
+use mpk_history::fleet::FleetCollector;
+use mpk_history::inference::InferenceSettings;
+use mpk_history::open_meteo::Area;
+use mpk_history::weather::WeatherCollector;
+use mpk_history::{backup, build_info, mpk, open_data, open_meteo, query};
 
 const DEFAULT_LOG_FILTER: &str = "info";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
