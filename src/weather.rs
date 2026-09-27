@@ -2,6 +2,7 @@ use anyhow::Result;
 use tracing::info;
 
 use crate::db::Db;
+use crate::fetch::Source;
 use crate::fetch_errors;
 use crate::open_meteo::{Area, Client};
 
@@ -27,7 +28,8 @@ impl WeatherCollector {
         let fetched_unix = jiff::Timestamp::now().as_second();
         let points = fetch_errors::recorded(
             &self.db,
-            self.client.fetch_current(&self.area, &self.model).await,
+            Source::OpenMeteo,
+            self.client.fetch_current(&self.area, &self.model),
         )
         .await?;
         let inserted = self

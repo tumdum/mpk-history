@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tracing::{debug, info, warn};
 
-use crate::db::{self, Db};
+use crate::db::{self, Db, PositionCount};
+use crate::fetch::Source;
 use crate::fetch_errors;
 use crate::geo::{self, MicroDegrees};
 use crate::mpk::{Client, Line, Position, VehicleType};
@@ -130,6 +131,25 @@ impl Tracker {
     }
 }
 
+fn position_counts(positions: &[Position]) -> Vec<PositionCount> {
+    VehicleType::ALL
+        .into_iter()
+        .filter_map(|vehicle_type| {
+            let of_type = positions.iter().filter(|p| p.vehicle_type == vehicle_type);
+            let received = of_type.clone().count();
+            if received == 0 {
+                return None;
+            }
+            let invalid = of_type.filter(|p| !p.has_valid_coordinates()).count();
+            Some(PositionCount {
+                vehicle_type,
+                received: i64::try_from(received).unwrap_or(i64::MAX),
+                invalid: i64::try_from(invalid).unwrap_or(i64::MAX),
+            })
+        })
+        .collect()
+}
+
 pub struct VehicleCollector {
     client: Client,
     db: Db,
@@ -171,15 +191,19 @@ impl VehicleCollector {
             debug!("already saved positions in this second, skipping");
             return Ok(());
         }
-        let mut positions =
-            fetch_errors::recorded(&self.db, self.client.fetch_positions(&self.lines).await)
-                .await?;
+        let mut positions = fetch_errors::recorded(
+            &self.db,
+            Source::MpkPositions,
+            self.client.fetch_positions(&self.lines),
+        )
+        .await?;
         let fetched = positions.len();
+        let counts = position_counts(&positions);
         positions.retain(Position::has_valid_coordinates);
         let matches = self.tracker.match_positions(&positions, now_unix);
         let new_ids = self
             .db
-            .save_positions(now_unix, &matches.new, &matches.seen_again_ids())
+            .save_positions_with_counts(now_unix, &matches.new, &matches.seen_again_ids(), &counts)
             .await?;
         self.last_saved_unix = Some(now_unix);
         info!(
@@ -200,7 +224,7 @@ impl VehicleCollector {
         if fresh {
             return;
         }
-        match fetch_errors::recorded(&self.db, self.client.fetch_lines().await).await {
+        match fetch_errors::recorded(&self.db, Source::MpkLines, self.client.fetch_lines()).await {
             Ok(lines) => {
                 info!(count = lines.len(), "fetched line list");
                 self.lines = lines;
@@ -251,6 +275,34 @@ mod tests {
         let result = (matches.new.len(), matches.seen_again_ids());
         tracker.record(matches, new_ids, now_unix);
         result
+    }
+
+    #[test]
+    fn counts_received_and_invalid_positions_per_type() {
+        let mut tram = position(3, 51.1, 17.0);
+        tram.vehicle_type = VehicleType::Tram;
+        let positions = [
+            position(1, 51.0, 17.0),
+            position(2, 0.0, 0.0),
+            position(4, 91.0, 17.0),
+            tram,
+        ];
+        assert_eq!(
+            position_counts(&positions),
+            [
+                PositionCount {
+                    vehicle_type: VehicleType::Bus,
+                    received: 3,
+                    invalid: 2
+                },
+                PositionCount {
+                    vehicle_type: VehicleType::Tram,
+                    received: 1,
+                    invalid: 0
+                },
+            ]
+        );
+        assert!(position_counts(&[]).is_empty());
     }
 
     #[test]

@@ -17,6 +17,13 @@ pub enum Source {
 }
 
 impl Source {
+    pub const ALL: [Source; 4] = [
+        Source::MpkLines,
+        Source::MpkPositions,
+        Source::OpenMeteo,
+        Source::OpenData,
+    ];
+
     #[must_use]
     pub fn id(self) -> i64 {
         self as i64
@@ -30,6 +37,17 @@ impl Source {
             Source::OpenMeteo => "open-meteo",
             Source::OpenData => "open data fleet",
         }
+    }
+}
+
+impl TryFrom<i64> for Source {
+    type Error = anyhow::Error;
+
+    fn try_from(id: i64) -> anyhow::Result<Self> {
+        Source::ALL
+            .into_iter()
+            .find(|source| source.id() == id)
+            .ok_or_else(|| anyhow::anyhow!("unknown fetch source id: {id}"))
     }
 }
 

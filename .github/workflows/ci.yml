@@ -22,10 +22,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install --profile minimal
+      - uses: browser-actions/setup-chrome@v2
+        id: chrome
+        with:
+          install-chromedriver: true
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --locked
+        env:
+          CHROME: ${{ steps.chrome.outputs.chrome-path }}
+          CHROMEDRIVER: ${{ steps.chrome.outputs.chromedriver-path }}
 
   clippy:
     name: Clippy
@@ -102,8 +109,15 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo install --locked cargo-llvm-cov@0.9.1
+      - uses: browser-actions/setup-chrome@v2
+        id: chrome
+        with:
+          install-chromedriver: true
       - name: Compute coverage
         run: cargo llvm-cov --locked --html --output-dir ${{ env.COVERAGE_DIR }}
+        env:
+          CHROME: ${{ steps.chrome.outputs.chrome-path }}
+          CHROMEDRIVER: ${{ steps.chrome.outputs.chromedriver-path }}
       - name: Print coverage summary
         id: summary
         run: |

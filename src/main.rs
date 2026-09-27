@@ -1,9 +1,11 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use jiff::Timestamp;
+use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
@@ -16,7 +18,8 @@ use mpk_history::fleet::FleetCollector;
 use mpk_history::inference::InferenceSettings;
 use mpk_history::open_meteo::Area;
 use mpk_history::weather::WeatherCollector;
-use mpk_history::{backup, build_info, mpk, open_data, open_meteo, query};
+use mpk_history::web::Clock;
+use mpk_history::{backup, build_info, mpk, open_data, open_meteo, query, web};
 
 const DEFAULT_LOG_FILTER: &str = "info";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -48,6 +51,9 @@ enum Command {
 
         #[command(flatten)]
         fleet: FleetArgs,
+
+        #[command(flatten)]
+        web: WebArgs,
     },
     /// Show positions of all vehicles of a line, or of one vehicle by plate, at a given time
     Query {
@@ -127,8 +133,8 @@ fn parse_meters(input: &str) -> Result<f64, String> {
 #[derive(clap::Args)]
 struct WeatherArgs {
     /// Whether to also collect weather from open-meteo
-    #[arg(long, env = "MPK_WEATHER", value_enum, default_value_t = CollectorMode::Enabled)]
-    weather: CollectorMode,
+    #[arg(long, env = "MPK_WEATHER", value_enum, default_value_t = Mode::Enabled)]
+    weather: Mode,
 
     /// open-meteo counts every grid point as an API call; the free tier allows 10000 calls per day
     #[arg(long, env = "MPK_WEATHER_INTERVAL_SECS", default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..))]
@@ -146,16 +152,16 @@ struct WeatherArgs {
 #[derive(clap::Args)]
 struct FleetArgs {
     /// Whether to match courses to side and plate numbers from Wrocław open data
-    #[arg(long, env = "MPK_FLEET", value_enum, default_value_t = CollectorMode::Enabled)]
-    fleet: CollectorMode,
+    #[arg(long, env = "MPK_FLEET", value_enum, default_value_t = Mode::Enabled)]
+    fleet: Mode,
 
     /// The open data vehicle list is refreshed about every 15 minutes
     #[arg(long, env = "MPK_FLEET_INTERVAL_SECS", default_value_t = 900, value_parser = clap::value_parser!(u64).range(1..))]
     fleet_interval_secs: u64,
 
     /// Whether to copy a matched vehicle to the brigade's previous and next course on the same line
-    #[arg(long, env = "MPK_FLEET_INFERENCE", value_enum, default_value_t = CollectorMode::Enabled)]
-    fleet_inference: CollectorMode,
+    #[arg(long, env = "MPK_FLEET_INFERENCE", value_enum, default_value_t = Mode::Enabled)]
+    fleet_inference: Mode,
 
     /// Longest break between one course's end and the next course's start to treat them as one brigade
     #[arg(long, env = "MPK_FLEET_INFERENCE_MAX_GAP_SECS", default_value_t = 2700)]
@@ -168,7 +174,7 @@ struct FleetArgs {
 
 impl FleetArgs {
     fn inference(&self) -> Result<Option<InferenceSettings>> {
-        if let CollectorMode::Disabled = self.fleet_inference {
+        if let Mode::Disabled = self.fleet_inference {
             return Ok(None);
         }
         Ok(Some(InferenceSettings {
@@ -178,8 +184,19 @@ impl FleetArgs {
     }
 }
 
+#[derive(clap::Args)]
+struct WebArgs {
+    /// Whether to also serve a web page with statistics and charts
+    #[arg(long, env = "MPK_WEB", value_enum, default_value_t = Mode::Enabled)]
+    web: Mode,
+
+    /// Address the web page listens on
+    #[arg(long, env = "MPK_LISTEN", default_value = "127.0.0.1:8080")]
+    listen: SocketAddr,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
-enum CollectorMode {
+enum Mode {
     Enabled,
     Disabled,
 }
@@ -205,10 +222,11 @@ async fn main() -> Result<()> {
             vehicles,
             weather,
             fleet,
+            web,
         } => {
             let db = Db::open(&args.database, OpenMode::CreateIfMissing).await?;
             info!(database = %args.database.display(), "database ready");
-            let result = collect(&db, vehicles, weather, fleet).await;
+            let result = collect(&db, vehicles, weather, fleet, web).await;
             db.close().await;
             result
         }
@@ -245,7 +263,12 @@ async fn collect(
     vehicle_args: VehicleArgs,
     weather_args: WeatherArgs,
     fleet_args: FleetArgs,
+    web_args: WebArgs,
 ) -> Result<()> {
+    let listener = match web_args.web {
+        Mode::Enabled => Some(TcpListener::bind(web_args.listen).await?),
+        Mode::Disabled => None,
+    };
     let http = reqwest::Client::builder()
         .user_agent(build_info::user_agent())
         .timeout(REQUEST_TIMEOUT)
@@ -265,7 +288,7 @@ async fn collect(
     });
 
     let weather_loop = async {
-        if let CollectorMode::Disabled = weather_args.weather {
+        if let Mode::Disabled = weather_args.weather {
             return;
         }
         info!(area = %weather_args.weather_area, model = weather_args.weather_model, "collecting weather");
@@ -285,7 +308,7 @@ async fn collect(
     };
 
     let fleet_loop = async {
-        if let CollectorMode::Disabled = fleet_args.fleet {
+        if let Mode::Disabled = fleet_args.fleet {
             return Ok(());
         }
         info!("matching courses to fleet open data");
@@ -304,6 +327,22 @@ async fn collect(
         Ok(())
     };
 
+    let web_loop = async {
+        let Some(listener) = listener else {
+            return Ok(());
+        };
+        info!(address = %listener.local_addr()?, "serving statistics");
+        let mut stop = stop_rx.clone();
+        let stopped = async move {
+            stop.changed().await.ok();
+        };
+        let result = web::serve(listener, db.clone(), Clock::System, stopped).await;
+        if let Err(e) = &result {
+            warn!("web page failed: {e:#}");
+        }
+        result
+    };
+
     let shutdown = async {
         let result = shutdown_signal().await;
         info!("shutting down");
@@ -311,9 +350,9 @@ async fn collect(
         result
     };
 
-    let (result, (), (), fleet_result) =
-        tokio::join!(shutdown, vehicles_loop, weather_loop, fleet_loop);
-    result.and(fleet_result)
+    let (result, (), (), fleet_result, web_result) =
+        tokio::join!(shutdown, vehicles_loop, weather_loop, fleet_loop, web_loop);
+    result.and(fleet_result).and(web_result)
 }
 
 async fn run_every(
@@ -353,5 +392,22 @@ mod tests {
     #[test]
     fn cli_is_valid() {
         Args::command().debug_assert();
+    }
+
+    fn web_args(args: &[&str]) -> WebArgs {
+        let args = Args::try_parse_from(args).unwrap();
+        let Command::Collect { web, .. } = args.command else {
+            panic!("expected collect");
+        };
+        web
+    }
+
+    #[test]
+    fn collect_serves_the_web_page_by_default() {
+        let web = web_args(&["mpk-history", "collect"]);
+        assert!(matches!(web.web, Mode::Enabled));
+        assert_eq!(web.listen, SocketAddr::from(([127, 0, 0, 1], 8080)));
+        let web = web_args(&["mpk-history", "collect", "--web", "disabled"]);
+        assert!(matches!(web.web, Mode::Disabled));
     }
 }

@@ -8,6 +8,7 @@
 
 pub mod backup;
 pub mod build_info;
+pub mod charts;
 pub mod collector;
 pub mod db;
 pub mod fetch;
@@ -20,4 +21,6 @@ pub mod open_data;
 pub mod open_meteo;
 pub mod query;
 pub mod speed;
+pub mod stats;
 pub mod weather;
+pub mod web;

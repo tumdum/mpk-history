@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 
-use crate::fetch::FetchError;
+use crate::fetch::{FetchError, Source};
 use crate::geo::MicroDegrees;
 use crate::mpk::{Position, VehicleType};
 use crate::open_meteo::GridPoint;
@@ -16,6 +16,7 @@ use crate::open_meteo::GridPoint;
 const MAX_CONNECTIONS: u32 = 1;
 
 pub const MAX_ROW_SPAN: Duration = Duration::from_mins(10);
+pub const COUNT_BUCKET: Duration = Duration::from_mins(1);
 
 pub enum OpenMode {
     CreateIfMissing,
@@ -43,6 +44,26 @@ pub struct PathPoint {
     pub longitude: MicroDegrees,
     pub first_seen_unix: i64,
     pub last_seen_unix: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchCount {
+    pub source: Source,
+    pub attempts: i64,
+    pub failures: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PositionCount {
+    pub vehicle_type: VehicleType,
+    pub received: i64,
+    pub invalid: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TypedPathPoint {
+    pub vehicle_type: VehicleType,
+    pub point: PathPoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -265,7 +286,33 @@ impl Db {
         new: &[&Position],
         seen_again: &[i64],
     ) -> Result<Vec<i64>> {
+        self.save_positions_with_counts(seen_at_unix, new, seen_again, &[])
+            .await
+    }
+
+    pub async fn save_positions_with_counts(
+        &self,
+        seen_at_unix: i64,
+        new: &[&Position],
+        seen_again: &[i64],
+        counts: &[PositionCount],
+    ) -> Result<Vec<i64>> {
         let mut tx = self.pool.begin().await?;
+        let minute_unix = count_bucket_start(seen_at_unix);
+        for count in counts {
+            sqlx::query(
+                "INSERT INTO position_counts (vehicle_type, minute_unix, received, invalid) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT (vehicle_type, minute_unix) DO UPDATE \
+                 SET received = received + excluded.received, invalid = invalid + excluded.invalid",
+            )
+            .bind(count.vehicle_type.id())
+            .bind(minute_unix)
+            .bind(count.received)
+            .bind(count.invalid)
+            .execute(&mut *tx)
+            .await?;
+        }
         for row_id in seen_again {
             sqlx::query(
                 "UPDATE vehicle_positions SET seen_for_secs = ? - first_seen_unix WHERE id = ?",
@@ -367,31 +414,143 @@ impl Db {
         Ok(inserted)
     }
 
-    pub async fn save_fetch_error(&self, error: &FetchError) -> Result<()> {
-        let attempt = &error.attempt;
-        let response = error.response.as_ref();
-        let body = response.and_then(|response| response.body.as_ref());
+    pub async fn save_fetch_outcome(
+        &self,
+        source: Source,
+        started_unix: i64,
+        error: Option<&FetchError>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO fetch_errors \
-             (source, kind, started_unix, elapsed_ms, method, url, request_body, http_status, \
-              response_headers, response_bytes, response_body, message) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO fetch_attempts (source, minute_unix, attempts, failures) \
+             VALUES (?, ?, 1, ?) \
+             ON CONFLICT (source, minute_unix) DO UPDATE \
+             SET attempts = attempts + 1, failures = failures + excluded.failures",
         )
-        .bind(attempt.source.id())
-        .bind(error.kind.id())
-        .bind(attempt.started_unix)
-        .bind(i64::try_from(error.elapsed.as_millis()).unwrap_or(i64::MAX))
-        .bind(&attempt.method)
-        .bind(&attempt.url)
-        .bind(&attempt.request_body)
-        .bind(response.map(|response| i64::from(response.status.as_u16())))
-        .bind(response.map(|response| response.headers.as_str()))
-        .bind(body.map(|body| i64::try_from(body.total_bytes).unwrap_or(i64::MAX)))
-        .bind(body.map(|body| body.text.as_str()))
-        .bind(&error.message)
-        .execute(&self.pool)
+        .bind(source.id())
+        .bind(count_bucket_start(started_unix))
+        .bind(i64::from(error.is_some()))
+        .execute(&mut *tx)
         .await?;
+        if let Some(error) = error {
+            insert_fetch_error(&mut tx, error).await?;
+        }
+        tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn fetch_counts(&self, from_unix: i64, to_unix: i64) -> Result<Vec<FetchCount>> {
+        let source_ids: Vec<i64> = Source::ALL.iter().map(|source| source.id()).collect();
+        let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT source, SUM(attempts), SUM(failures) FROM fetch_attempts \
+             WHERE source IN (SELECT value FROM json_each(?1)) \
+               AND minute_unix >= ?2 AND minute_unix < ?3 \
+             GROUP BY source ORDER BY source",
+        )
+        .bind(serde_json::to_string(&source_ids)?)
+        .bind(from_unix)
+        .bind(to_unix)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(source, attempts, failures)| {
+                Ok(FetchCount {
+                    source: source.try_into()?,
+                    attempts,
+                    failures,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn fetch_counts_by_minute(
+        &self,
+        from_unix: i64,
+        to_unix: i64,
+    ) -> Result<Vec<(i64, FetchCount)>> {
+        let source_ids: Vec<i64> = Source::ALL.iter().map(|source| source.id()).collect();
+        let rows: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT source, minute_unix, attempts, failures FROM fetch_attempts \
+             WHERE source IN (SELECT value FROM json_each(?1)) \
+               AND minute_unix >= ?2 AND minute_unix < ?3 \
+             ORDER BY minute_unix, source",
+        )
+        .bind(serde_json::to_string(&source_ids)?)
+        .bind(from_unix)
+        .bind(to_unix)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(source, minute_unix, attempts, failures)| {
+                Ok((
+                    minute_unix,
+                    FetchCount {
+                        source: source.try_into()?,
+                        attempts,
+                        failures,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn position_counts_by_minute(
+        &self,
+        from_unix: i64,
+        to_unix: i64,
+    ) -> Result<Vec<(i64, PositionCount)>> {
+        let type_ids: Vec<i64> = VehicleType::ALL.iter().map(|t| t.id()).collect();
+        let rows: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT vehicle_type, minute_unix, received, invalid FROM position_counts \
+             WHERE vehicle_type IN (SELECT value FROM json_each(?1)) \
+               AND minute_unix >= ?2 AND minute_unix < ?3 \
+             ORDER BY minute_unix, vehicle_type",
+        )
+        .bind(serde_json::to_string(&type_ids)?)
+        .bind(from_unix)
+        .bind(to_unix)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(vehicle_type, minute_unix, received, invalid)| {
+                Ok((
+                    minute_unix,
+                    PositionCount {
+                        vehicle_type: vehicle_type.try_into()?,
+                        received,
+                        invalid,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn position_counts(
+        &self,
+        from_unix: i64,
+        to_unix: i64,
+    ) -> Result<Vec<PositionCount>> {
+        let type_ids: Vec<i64> = VehicleType::ALL.iter().map(|t| t.id()).collect();
+        let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT vehicle_type, SUM(received), SUM(invalid) FROM position_counts \
+             WHERE vehicle_type IN (SELECT value FROM json_each(?1)) \
+               AND minute_unix >= ?2 AND minute_unix < ?3 \
+             GROUP BY vehicle_type ORDER BY vehicle_type",
+        )
+        .bind(serde_json::to_string(&type_ids)?)
+        .bind(from_unix)
+        .bind(to_unix)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(vehicle_type, received, invalid)| {
+                Ok(PositionCount {
+                    vehicle_type: vehicle_type.try_into()?,
+                    received,
+                    invalid,
+                })
+            })
+            .collect()
     }
 
     pub async fn positions_at(
@@ -474,6 +633,61 @@ impl Db {
                 },
             )
             .collect())
+    }
+
+    pub async fn path_points_started_between(
+        &self,
+        from_unix: i64,
+        to_unix: i64,
+    ) -> Result<Vec<TypedPathPoint>> {
+        let rows: Vec<(i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT l.vehicle_type, p.line_id, p.course_id, p.latitude_e6, p.longitude_e6, \
+                    p.first_seen_unix, p.first_seen_unix + p.seen_for_secs \
+             FROM vehicle_positions p \
+             JOIN lines l ON l.id = p.line_id \
+             WHERE p.line_id IN (SELECT id FROM lines) \
+               AND p.first_seen_unix >= ?1 AND p.first_seen_unix < ?2 \
+             ORDER BY p.line_id, p.course_id, p.first_seen_unix",
+        )
+        .bind(from_unix)
+        .bind(to_unix)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(
+                |(
+                    vehicle_type,
+                    line_id,
+                    course_id,
+                    latitude_e6,
+                    longitude_e6,
+                    first_seen_unix,
+                    last_seen_unix,
+                )| {
+                    Ok(TypedPathPoint {
+                        vehicle_type: vehicle_type.try_into()?,
+                        point: PathPoint {
+                            line_id,
+                            course_id,
+                            latitude: MicroDegrees(latitude_e6),
+                            longitude: MicroDegrees(longitude_e6),
+                            first_seen_unix,
+                            last_seen_unix,
+                        },
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub async fn first_seen_unix(&self) -> Result<Option<i64>> {
+        let (first,): (Option<i64>,) = sqlx::query_as(
+            "SELECT MIN((SELECT MIN(first_seen_unix) FROM vehicle_positions WHERE line_id = l.id)) \
+             FROM lines l",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(first)
     }
 
     pub async fn positions_active_at(
@@ -694,6 +908,38 @@ impl Db {
     pub async fn close(self) {
         self.pool.close().await;
     }
+}
+
+async fn insert_fetch_error(conn: &mut SqliteConnection, error: &FetchError) -> Result<()> {
+    let attempt = &error.attempt;
+    let response = error.response.as_ref();
+    let body = response.and_then(|response| response.body.as_ref());
+    sqlx::query(
+        "INSERT INTO fetch_errors \
+         (source, kind, started_unix, elapsed_ms, method, url, request_body, http_status, \
+          response_headers, response_bytes, response_body, message) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(attempt.source.id())
+    .bind(error.kind.id())
+    .bind(attempt.started_unix)
+    .bind(i64::try_from(error.elapsed.as_millis()).unwrap_or(i64::MAX))
+    .bind(&attempt.method)
+    .bind(&attempt.url)
+    .bind(&attempt.request_body)
+    .bind(response.map(|response| i64::from(response.status.as_u16())))
+    .bind(response.map(|response| response.headers.as_str()))
+    .bind(body.map(|body| i64::try_from(body.total_bytes).unwrap_or(i64::MAX)))
+    .bind(body.map(|body| body.text.as_str()))
+    .bind(&error.message)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+fn count_bucket_start(unix: i64) -> i64 {
+    let bucket_secs = duration_secs(COUNT_BUCKET);
+    unix.div_euclid(bucket_secs) * bucket_secs
 }
 
 async fn propagate_correction(conn: &mut SqliteConnection, course_id: i64) -> Result<(u64, u64)> {
@@ -1236,7 +1482,13 @@ mod tests {
         .await
         .err()
         .unwrap();
-        db.save_fetch_error(&error).await.unwrap();
+        db.save_fetch_outcome(
+            crate::fetch::Source::OpenData,
+            error.attempt.started_unix,
+            Some(&error),
+        )
+        .await
+        .unwrap();
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT source, kind, started_unix, method, url, http_status, message \
                  FROM fetch_errors",
@@ -1256,6 +1508,162 @@ mod tests {
                 error.message,
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn lists_path_points_started_in_a_range_per_course() {
+        let db = open().await;
+        let bus = position(VehicleType::Bus, "a", 2);
+        let tram = position(VehicleType::Tram, "1", 1);
+        db.save_positions(99, &[&bus], &[]).await.unwrap();
+        let ids = db.save_positions(100, &[&bus, &tram], &[]).await.unwrap();
+        db.save_positions(110, &[&bus], &[ids[1]]).await.unwrap();
+        db.save_positions(120, &[&tram], &[]).await.unwrap();
+
+        let points = db.path_points_started_between(100, 120).await.unwrap();
+        let summary: Vec<_> = points
+            .iter()
+            .map(|p| {
+                (
+                    p.vehicle_type,
+                    p.point.course_id,
+                    p.point.first_seen_unix,
+                    p.point.last_seen_unix,
+                )
+            })
+            .collect();
+        let bus_line = line_id(&db, "a").await;
+        let tram_line = line_id(&db, "1").await;
+        let mut expected = vec![
+            (bus_line, (VehicleType::Bus, 2, 100, 100)),
+            (bus_line, (VehicleType::Bus, 2, 110, 110)),
+            (tram_line, (VehicleType::Tram, 1, 100, 110)),
+        ];
+        expected.sort_by_key(|(line, (_, _, first, _))| (*line, *first));
+        let expected: Vec<_> = expected.into_iter().map(|(_, row)| row).collect();
+        assert_eq!(summary, expected);
+        assert_eq!(points[0].point.latitude, bus.latitude);
+    }
+
+    #[tokio::test]
+    async fn counts_fetch_attempts_and_failures_per_minute() {
+        let db = open().await;
+        let url = crate::fetch::tests::refused_url();
+        let error = crate::fetch::send(
+            crate::fetch::Source::MpkLines,
+            reqwest::Client::new().get(&url),
+        )
+        .await
+        .err()
+        .unwrap();
+        let minute = 1_800_000_000;
+        db.save_fetch_outcome(Source::MpkPositions, minute, None)
+            .await
+            .unwrap();
+        db.save_fetch_outcome(Source::MpkPositions, minute + 59, None)
+            .await
+            .unwrap();
+        db.save_fetch_outcome(Source::MpkPositions, minute + 60, Some(&error))
+            .await
+            .unwrap();
+        db.save_fetch_outcome(Source::OpenMeteo, minute + 120, None)
+            .await
+            .unwrap();
+
+        let count = |source, attempts, failures| FetchCount {
+            source,
+            attempts,
+            failures,
+        };
+        assert_eq!(
+            db.fetch_counts(minute, minute + 180).await.unwrap(),
+            [
+                count(Source::MpkPositions, 3, 1),
+                count(Source::OpenMeteo, 1, 0),
+            ]
+        );
+        assert_eq!(
+            db.fetch_counts(minute, minute + 60).await.unwrap(),
+            [count(Source::MpkPositions, 2, 0)]
+        );
+        assert!(
+            db.fetch_counts(minute + 180, minute + 240)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let (errors,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM fetch_errors")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(errors, 1);
+    }
+
+    #[tokio::test]
+    async fn counts_received_and_invalid_positions_with_the_positions() {
+        let db = open().await;
+        let bus = position(VehicleType::Bus, "a", 1);
+        let count = |vehicle_type, received, invalid| PositionCount {
+            vehicle_type,
+            received,
+            invalid,
+        };
+        let minute = 1_800_000_000;
+        db.save_positions_with_counts(
+            minute,
+            &[&bus],
+            &[],
+            &[
+                count(VehicleType::Bus, 3, 1),
+                count(VehicleType::Tram, 2, 0),
+            ],
+        )
+        .await
+        .unwrap();
+        db.save_positions_with_counts(minute + 10, &[], &[], &[count(VehicleType::Bus, 4, 2)])
+            .await
+            .unwrap();
+        db.save_positions_with_counts(minute + 60, &[], &[], &[count(VehicleType::Bus, 1, 1)])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.position_counts(minute, minute + 60).await.unwrap(),
+            [
+                count(VehicleType::Bus, 7, 3),
+                count(VehicleType::Tram, 2, 0)
+            ]
+        );
+        assert_eq!(
+            db.position_counts(minute, minute + 120).await.unwrap(),
+            [
+                count(VehicleType::Bus, 8, 4),
+                count(VehicleType::Tram, 2, 0)
+            ]
+        );
+        assert_eq!(
+            db.position_counts_by_minute(minute, minute + 120)
+                .await
+                .unwrap(),
+            [
+                (minute, count(VehicleType::Bus, 7, 3)),
+                (minute, count(VehicleType::Tram, 2, 0)),
+                (minute + 60, count(VehicleType::Bus, 1, 1)),
+            ]
+        );
+        assert_eq!(line_count(&db).await, 1);
+    }
+
+    #[tokio::test]
+    async fn finds_the_first_stored_position() {
+        let db = open().await;
+        assert_eq!(db.first_seen_unix().await.unwrap(), None);
+        let bus = position(VehicleType::Bus, "a", 1);
+        let tram = position(VehicleType::Tram, "1", 2);
+        db.save_positions(200, &[&bus], &[]).await.unwrap();
+        db.save_positions(150, &[&tram], &[]).await.unwrap();
+        db.save_positions(300, &[&tram], &[]).await.unwrap();
+        assert_eq!(db.first_seen_unix().await.unwrap(), Some(150));
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ use crate::db::PathPoint;
 use crate::geo;
 
 const MIN_SPAN_SECS: i64 = 20;
-const KMH_PER_METER_PER_SECOND: f64 = 3.6;
+pub const KMH_PER_METER_PER_SECOND: f64 = 3.6;
 
 #[must_use]
 pub fn average_speed_kmh(

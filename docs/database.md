@@ -2,15 +2,16 @@
 
 All data is stored in one SQLite file, `mpk-history.sqlite` by default (`--database`
 or `MPK_DATABASE`). The code accesses it with sqlx (`src/db.rs`). Where the data comes
-from is described in [data-sources.md](data-sources.md).
+from is described in [data-sources.md](data-sources.md). The web page built on top of
+it is described in [web.md](web.md).
 
 ## Opening and migrations
 
 - **Journal mode:** the database runs in WAL mode with `synchronous = NORMAL`. Readers
   such as `sqlite3` or `query` can work while the collector writes. The `-wal` and
   `-shm` files next to the database belong to it.
-- **Connection:** the pool has one connection. The three collector loops share it, and
-  each save is one transaction.
+- **Connection:** the pool has one connection. The three collector loops and the web
+  page share it, and each save is one transaction.
 - **Migrations:** the schema is built by the SQL files in `migrations/`. They are
   compiled into the binary (`sqlx::migrate!`), and `build.rs` makes Cargo rebuild when
   a migration file changes.
@@ -87,6 +88,18 @@ erDiagram
         INTEGER observed_unix
         INTEGER fetched_unix
         REAL temperature_2m
+    }
+    fetch_attempts {
+        INTEGER source PK
+        INTEGER minute_unix PK
+        INTEGER attempts
+        INTEGER failures
+    }
+    position_counts {
+        INTEGER vehicle_type PK
+        INTEGER minute_unix PK
+        INTEGER received
+        INTEGER invalid
     }
     fetch_errors {
         INTEGER id PK
@@ -213,6 +226,38 @@ Index: `UNIQUE (model, observed_unix, latitude_e6, longitude_e6)`. It also stops
 same value from being stored twice after a restart (`INSERT OR IGNORE`). Queries by
 time should include `model = '…'` to use this index.
 
+### `fetch_attempts`
+
+How many downloads each source had per minute, and how many failed. The collector adds
+1 to `attempts` for every download it starts and to `failures` when it fails, in the
+same transaction as the `fetch_errors` row. Counting started with migration `0014`;
+older failures are only in `fetch_errors`, without the number of attempts.
+
+| Column | Meaning |
+|---|---|
+| `source` | Same values as `fetch_errors.source` |
+| `minute_unix` | Start of the minute the download was started in |
+| `attempts` | Downloads started |
+| `failures` | Of those, downloads that failed |
+
+Primary key: `(source, minute_unix)`, without a rowid.
+
+### `position_counts`
+
+How many vehicle positions the MPK feed sent per minute and vehicle type, and how many
+had coordinates the collector threw away (outside ±90° / ±180°, or exactly `0, 0`). It
+is saved in the same transaction as the positions. Types without positions in a
+minute have no row.
+
+| Column | Meaning |
+|---|---|
+| `vehicle_type` | `0` bus, `1` tram, `2` train |
+| `minute_unix` | Start of the minute of the fetch |
+| `received` | Positions in the feed |
+| `invalid` | Of those, positions with invalid coordinates |
+
+Primary key: `(vehicle_type, minute_unix)`, without a rowid.
+
 ### `fetch_errors`
 
 One row per failed download from any external source. The collector saves the row and
@@ -251,12 +296,13 @@ Index: `fetch_errors_source_started (source, started_unix)`.
 
 | Query | Index used |
 |---|---|
-| `query --line`, fleet matching, inference summaries, speed | `vehicle_positions_line_first_seen` |
+| `query --line`, fleet matching, inference summaries, speed, web statistics | `vehicle_positions_line_first_seen` |
 | `query --plate` | `course_vehicles_plate`, then `vehicle_positions_line_first_seen` |
 | SIDE / PLATE / BRIGADE columns | `course_vehicles` primary key |
 | Tracker updates | `vehicle_positions` primary key |
 | Line lookup by name | `lines_name` |
 | `bbox` | none, it reads the whole table. This is fine for an occasional command |
+| Data quality on the web page | `fetch_attempts` and `position_counts` primary keys |
 
 ## Size
 
@@ -288,6 +334,7 @@ GROUP BY day;
 | `0011_lines_name_index` | Index on line name | |
 | `0012_inferred_course_vehicles` | `source` and `inferred_from_course_id` | |
 | `0013_fetch_errors` | Failed downloads table | |
+| `0014_quality_counts` | `fetch_attempts` and `position_counts` | |
 
 Before starting a new binary whose new migrations **rebuild a table**, stop the
 running collector. An old collector writing into a rebuilt table fails on every fetch.

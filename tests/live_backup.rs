@@ -2,15 +2,25 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
 use jiff::Timestamp;
 use jiff::civil;
 use jiff::tz::TimeZone;
+use mpk_history::db::{Db, OpenMode};
+use mpk_history::mpk::VehicleType;
+use mpk_history::stats::{self, Kind, Retention, StatsCache};
+use mpk_history::web::{self, Clock};
+use scraper::{Html, Selector};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;
+use tower::ServiceExt;
 
 const COMPRESSED_BACKUP: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -37,6 +47,8 @@ const MAX_LATITUDE_E6: i64 = 90_000_000;
 const MAX_LONGITUDE_E6: i64 = 180_000_000;
 // https://en.wikipedia.org/wiki/Earth_radius
 const EARTH_RADIUS_M: f64 = 6_371_000.0;
+// src/geo.rs counts 111 320 m per degree, which is the equatorial radius
+const METERS_PER_DEGREE_RADIUS_M: f64 = 6_378_137.0;
 const WEATHER_STEP_SECS: i64 = 15 * 60;
 const TRIP_BREAK_SECS: i64 = 6 * 60 * 60;
 const PHYSICAL_RANGES: [(&str, f64, f64); 12] = [
@@ -67,6 +79,23 @@ const FLEET_VALUE_SEPARATOR: char = '/';
 const UNKNOWN_SPEED: &str = "-";
 const VEHICLE_TYPES: [&str; 3] = ["bus", "tram", "train"];
 const QUERY_COLUMNS: usize = 13;
+const MINUTE_SECS: i64 = 60;
+const DAY_SECS: i64 = 24 * 60 * 60;
+const MONTH_SECS: i64 = 30 * DAY_SECS;
+const STEP_GAP_SECS: i64 = 60;
+const STEP_MARGIN_SECS: i64 = MAX_ROW_SPAN_SECS + STEP_GAP_SECS;
+const MAX_PLAUSIBLE_SPEED_KMH: f64 = 120.0;
+const KMH_PER_METER_PER_SECOND: f64 = 3.6;
+const SPEED_TOLERANCE_KMH: f64 = 0.001;
+const KIND_ALL: &str = "all";
+const DAY_RANGE: &str = "day";
+const BACKUP_FULL_DAY: (i16, i8, i8) = (2026, 9, 26);
+const HISTORY_RESOLUTION: Duration = Duration::from_mins(15);
+const LOCALHOST: &str = "127.0.0.1";
+const SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
+const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const SVG_CONTENT_TYPE: &str = "image/svg+xml";
+const TERMINATE_SIGNAL: &str = "-TERM";
 
 enum MatchSourceId {
     Matched = 0,
@@ -411,13 +440,17 @@ async fn expected_positions(
 }
 
 fn haversine_m(a: (i64, i64), b: (i64, i64)) -> f64 {
+    haversine_with_radius_m(a, b, EARTH_RADIUS_M)
+}
+
+fn haversine_with_radius_m(a: (i64, i64), b: (i64, i64), radius_m: f64) -> f64 {
     // https://en.wikipedia.org/wiki/Haversine_formula
     let radians = |e6: i64| (e6 as f64 / MICRO_DEGREES_PER_DEGREE).to_radians();
     let (lat_a, lon_a) = (radians(a.0), radians(a.1));
     let (lat_b, lon_b) = (radians(b.0), radians(b.1));
     let h = ((lat_b - lat_a) / 2.0).sin().powi(2)
         + lat_a.cos() * lat_b.cos() * ((lon_b - lon_a) / 2.0).sin().powi(2);
-    2.0 * EARTH_RADIUS_M * h.sqrt().asin()
+    2.0 * radius_m * h.sqrt().asin()
 }
 
 #[tokio::test]
@@ -1040,4 +1073,464 @@ async fn weather_observations_are_consistent() {
         &format!("SELECT * FROM weather_observations WHERE {outside_ranges}"),
     )
     .await;
+}
+
+#[derive(Debug, Default)]
+struct ScannedStats {
+    samples: u64,
+    vehicle_samples: [u64; VEHICLE_TYPES.len()],
+    peak_vehicles: u64,
+    distance_m: [f64; VEHICLE_TYPES.len()],
+    travel_secs: [i64; VEHICLE_TYPES.len()],
+}
+
+impl ScannedStats {
+    fn average_vehicles(&self, vehicle_type: Option<usize>) -> f64 {
+        let vehicles: u64 = match vehicle_type {
+            Some(index) => self.vehicle_samples[index],
+            None => self.vehicle_samples.iter().sum(),
+        };
+        vehicles as f64 / self.samples as f64
+    }
+
+    fn average_speed_kmh(&self, vehicle_type: Option<usize>) -> f64 {
+        let (distance_m, travel_secs) = match vehicle_type {
+            Some(index) => (self.distance_m[index], self.travel_secs[index]),
+            None => (self.distance_m.iter().sum(), self.travel_secs.iter().sum()),
+        };
+        distance_m / travel_secs as f64 * KMH_PER_METER_PER_SECOND
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct StepRow {
+    vehicle_type: i64,
+    lat: i64,
+    lon: i64,
+    first: i64,
+    last: i64,
+    next_lat: Option<i64>,
+    next_lon: Option<i64>,
+    next_first: Option<i64>,
+}
+
+impl StepRow {
+    fn step(&self) -> Option<((i64, i64), f64)> {
+        let (Some(next_lat), Some(next_lon), Some(next_first)) =
+            (self.next_lat, self.next_lon, self.next_first)
+        else {
+            return None;
+        };
+        let travel_secs = next_first - self.first;
+        if next_first - self.last > STEP_GAP_SECS || travel_secs <= 0 {
+            return None;
+        }
+        let distance_m = haversine_with_radius_m(
+            (self.lat, self.lon),
+            (next_lat, next_lon),
+            METERS_PER_DEGREE_RADIUS_M,
+        );
+        if distance_m / travel_secs as f64 * KMH_PER_METER_PER_SECOND > MAX_PLAUSIBLE_SPEED_KMH {
+            return None;
+        }
+        Some(((self.first, next_first), distance_m))
+    }
+}
+
+impl ScannedStats {
+    fn add_travel(
+        &mut self,
+        vehicle_type: i64,
+        window: (i64, i64),
+        (start_unix, end_unix): (i64, i64),
+        distance_m: f64,
+    ) {
+        let span_secs = end_unix - start_unix;
+        let overlap_secs = end_unix.min(window.1) - start_unix.max(window.0);
+        if span_secs <= 0 || overlap_secs <= 0 {
+            return;
+        }
+        self.distance_m[vehicle_type as usize] +=
+            distance_m * overlap_secs as f64 / span_secs as f64;
+        self.travel_secs[vehicle_type as usize] += overlap_secs;
+    }
+}
+
+async fn scan_stats(db: &SqlitePool, from_unix: i64, to_unix: i64) -> ScannedStats {
+    let oldest_first_seen_unix = from_unix - STEP_MARGIN_SECS;
+    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT l.vehicle_type, p.first_seen_unix, p.first_seen_unix + p.seen_for_secs \
+         FROM vehicle_positions p JOIN lines l ON l.id = p.line_id \
+         WHERE p.first_seen_unix >= ? AND p.first_seen_unix < ?",
+    )
+    .bind(oldest_first_seen_unix)
+    .bind(to_unix + STEP_MARGIN_SECS)
+    .fetch_all(db)
+    .await
+    .unwrap();
+    let all_times: std::collections::BTreeSet<i64> = rows
+        .iter()
+        .flat_map(|(_, first, last)| [*first, *last])
+        .collect();
+    let times: std::collections::BTreeSet<i64> = all_times
+        .iter()
+        .copied()
+        .filter(|unix| (from_unix..to_unix).contains(unix))
+        .collect();
+    let mut visible: HashMap<i64, [u64; VEHICLE_TYPES.len()]> = HashMap::new();
+    for (vehicle_type, first, last) in &rows {
+        for unix in times.range(*first..=*last) {
+            visible.entry(*unix).or_default()[*vehicle_type as usize] += 1;
+        }
+    }
+    let mut stats = ScannedStats {
+        samples: times.len() as u64,
+        ..ScannedStats::default()
+    };
+    for counts in visible.values() {
+        for (total, count) in stats.vehicle_samples.iter_mut().zip(counts) {
+            *total += count;
+        }
+        stats.peak_vehicles = stats.peak_vehicles.max(counts.iter().sum());
+    }
+
+    let window = (from_unix, to_unix);
+    let steps: Vec<StepRow> = sqlx::query_as(
+        "SELECT l.vehicle_type, p.latitude_e6 AS lat, p.longitude_e6 AS lon, \
+                p.first_seen_unix AS first, p.first_seen_unix + p.seen_for_secs AS last, \
+                LEAD(p.latitude_e6) OVER w AS next_lat, LEAD(p.longitude_e6) OVER w AS next_lon, \
+                LEAD(p.first_seen_unix) OVER w AS next_first \
+         FROM vehicle_positions p JOIN lines l ON l.id = p.line_id \
+         WHERE p.first_seen_unix >= ? AND p.first_seen_unix < ? \
+         WINDOW w AS (PARTITION BY p.line_id, p.course_id ORDER BY p.first_seen_unix)",
+    )
+    .bind(oldest_first_seen_unix)
+    .bind(to_unix + STEP_MARGIN_SECS)
+    .fetch_all(db)
+    .await
+    .unwrap();
+    for row in &steps {
+        let standing = (row.first, row.last);
+        match row.step() {
+            Some((span, distance_m)) => {
+                stats.add_travel(row.vehicle_type, window, span, distance_m);
+            }
+            None => {
+                let next_fetch = all_times.range(row.last + 1..).next();
+                if next_fetch.is_none_or(|next| next - row.last > STEP_GAP_SECS) {
+                    stats.add_travel(row.vehicle_type, window, standing, 0.0);
+                }
+            }
+        }
+    }
+    stats
+}
+
+async fn vehicle_types_seen(db: &SqlitePool, from_unix: i64, to_unix: i64) -> Vec<usize> {
+    let types: Vec<(i64,)> = sqlx::query_as(
+        "SELECT DISTINCT l.vehicle_type FROM vehicle_positions p JOIN lines l ON l.id = p.line_id \
+         WHERE p.first_seen_unix + p.seen_for_secs >= ? AND p.first_seen_unix < ? ORDER BY 1",
+    )
+    .bind(from_unix)
+    .bind(to_unix)
+    .fetch_all(db)
+    .await
+    .unwrap();
+    types.into_iter().map(|(t,)| t as usize).collect()
+}
+
+async fn web_page(database: &Path, uri: &str, now_unix: i64) -> Html {
+    let db = Db::open(database, OpenMode::MustExist).await.unwrap();
+    let clock = Clock::Fixed(Timestamp::from_second(now_unix).unwrap());
+    let response = web::router(db.clone(), clock)
+        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    db.close().await;
+    Html::parse_document(std::str::from_utf8(&body).unwrap())
+}
+
+async fn computed_totals(
+    database: &Path,
+    resolution: Duration,
+    window: (i64, i64),
+    now_unix: i64,
+) -> stats::Bucket {
+    let db = Db::open(database, OpenMode::MustExist).await.unwrap();
+    let buckets = StatsCache::new(resolution, Retention::Forever)
+        .buckets(&db, window.0, window.1, now_unix)
+        .await
+        .unwrap();
+    db.close().await;
+    stats::sum(&buckets)
+}
+
+async fn last_seen_unix(db: &SqlitePool) -> i64 {
+    count(
+        db,
+        "SELECT MAX(first_seen_unix + seen_for_secs) FROM vehicle_positions",
+    )
+    .await
+}
+
+fn single_text(html: &Html, selector: &str) -> String {
+    let parsed = Selector::parse(selector).unwrap();
+    let texts: Vec<String> = html
+        .select(&parsed)
+        .map(|element| element.text().collect())
+        .collect();
+    let [text] = &texts[..] else {
+        panic!("expected one element for {selector}, got {texts:?}");
+    };
+    text.clone()
+}
+
+fn assert_matches_scan(
+    shown_types: &[usize],
+    scanned: &ScannedStats,
+    computed: &stats::Bucket,
+    cell: impl Fn(&str, &str) -> String,
+) {
+    let kinds = std::iter::once((KIND_ALL, None))
+        .chain(shown_types.iter().map(|t| (VEHICLE_TYPES[*t], Some(*t))));
+    for (kind, vehicle_type) in kinds {
+        assert_eq!(
+            cell(kind, "average-vehicles"),
+            format!("{:.1}", scanned.average_vehicles(vehicle_type)),
+            "{kind}"
+        );
+        let speed = computed
+            .get(stats_kind(vehicle_type))
+            .average_speed_kmh()
+            .unwrap();
+        let scanned_speed = scanned.average_speed_kmh(vehicle_type);
+        assert!(
+            (speed - scanned_speed).abs() <= SPEED_TOLERANCE_KMH,
+            "{kind}: computed {speed:.3} km/h, scan gives {scanned_speed:.3} km/h"
+        );
+        assert_eq!(cell(kind, "average-speed"), format!("{speed:.1}"), "{kind}");
+        assert!(MEDIAN_SPEED_KMH.contains(&speed), "{kind}: {speed} km/h");
+    }
+    assert_eq!(
+        cell(KIND_ALL, "peak-vehicles"),
+        scanned.peak_vehicles.to_string()
+    );
+}
+
+fn stats_kind(vehicle_type: Option<usize>) -> Kind {
+    vehicle_type.map_or(Kind::All, |index| {
+        Kind::Vehicle(VehicleType::try_from(i64::try_from(index).unwrap()).unwrap())
+    })
+}
+
+#[tokio::test]
+async fn web_statistics_match_a_scan_of_the_backup() {
+    let database = TestDatabase::migrated_backup();
+    let db = open(&database.path).await;
+    let now_unix = last_seen_unix(&db).await;
+    let to_unix = (now_unix + MINUTE_SECS - 1).div_euclid(MINUTE_SECS) * MINUTE_SECS;
+    let window = (to_unix - DAY_SECS, to_unix);
+    let scanned = scan_stats(&db, window.0, window.1).await;
+    let html = web_page(&database.path, "/", now_unix).await;
+    let computed = computed_totals(&database.path, stats::BUCKET, window, now_unix).await;
+
+    let shown_types = vehicle_types_seen(&db, to_unix - MONTH_SECS, to_unix).await;
+    let expected_tables: Vec<String> = std::iter::once(KIND_ALL)
+        .chain(shown_types.iter().map(|t| VEHICLE_TYPES[*t]))
+        .map(|kind| format!("stats-{kind}"))
+        .collect();
+    let table_selector = Selector::parse("#summary table.stats").unwrap();
+    let tables: Vec<String> = html
+        .select(&table_selector)
+        .filter_map(|table| table.value().attr("id").map(str::to_owned))
+        .collect();
+    assert_eq!(tables, expected_tables);
+
+    assert_matches_scan(&shown_types, &scanned, &computed, |kind, metric| {
+        single_text(
+            &html,
+            &format!("#stats-{kind} tr[data-metric={metric}] td[data-range={DAY_RANGE}]"),
+        )
+    });
+}
+
+#[tokio::test]
+async fn calendar_day_page_matches_a_scan_of_that_day() {
+    let database = TestDatabase::migrated_backup();
+    let db = open(&database.path).await;
+    let now_unix = last_seen_unix(&db).await;
+    let first_unix = count(&db, "SELECT MIN(first_seen_unix) FROM vehicle_positions").await;
+    let tz = TimeZone::system();
+    let day = civil::date(BACKUP_FULL_DAY.0, BACKUP_FULL_DAY.1, BACKUP_FULL_DAY.2);
+    let start = |date: civil::Date| date.to_zoned(tz.clone()).unwrap().timestamp().as_second();
+    let window = (start(day), start(day.tomorrow().unwrap()));
+    assert!(
+        first_unix < window.0 && window.1 < now_unix,
+        "the backup doesn't cover {day}"
+    );
+    let scanned = scan_stats(&db, window.0, window.1).await;
+    let computed = computed_totals(&database.path, HISTORY_RESOLUTION, window, now_unix).await;
+    let html = web_page(
+        &database.path,
+        &format!("/day/{}", day.strftime("%Y-%m-%d")),
+        now_unix,
+    )
+    .await;
+
+    assert_eq!(
+        single_text(&html, "h1"),
+        day.strftime("%A, %-d %B %Y").to_string()
+    );
+    let shown_types = vehicle_types_seen(&db, window.0, window.1).await;
+    assert_matches_scan(&shown_types, &scanned, &computed, |kind, metric| {
+        single_text(
+            &html,
+            &format!("#period-stats tr[data-metric={metric}] td[data-kind={kind}]"),
+        )
+    });
+}
+
+struct RunningServer(Child);
+
+impl Drop for RunningServer {
+    fn drop(&mut self) {
+        self.0.kill().ok();
+        self.0.wait().ok();
+    }
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind((LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+async fn get_when_ready(client: &reqwest::Client, url: &str) -> reqwest::Response {
+    let started = Instant::now();
+    loop {
+        match client.get(url).send().await {
+            Ok(response) => return response,
+            Err(e) if started.elapsed() > SERVER_START_TIMEOUT => {
+                panic!("server did not answer {url}: {e}")
+            }
+            Err(_) => tokio::time::sleep(SERVER_POLL_INTERVAL).await,
+        }
+    }
+}
+
+fn collect(database: &Path, web: &str, address: &str, dead_proxy: &str) -> RunningServer {
+    let child = Command::new(BINARY)
+        .arg("--database")
+        .arg(database)
+        .args(["collect", "--web", web, "--listen", address])
+        .args(["--weather", "disabled", "--fleet", "disabled"])
+        .env("TZ", TIME_ZONE)
+        .env("RUST_LOG", LOG_FILTER)
+        .env("HTTP_PROXY", dead_proxy)
+        .env("HTTPS_PROXY", dead_proxy)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .spawn()
+        .unwrap();
+    RunningServer(child)
+}
+
+fn dead_proxy() -> String {
+    format!("http://{LOCALHOST}:{}", free_port())
+}
+
+fn local_client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
+async fn fetch_error_count(database: &Path) -> i64 {
+    let db = open(database).await;
+    let errors = count(&db, "SELECT COUNT(*) FROM fetch_errors").await;
+    db.close().await;
+    errors
+}
+
+async fn wait_for_new_fetch_errors(database: &Path, before: i64) {
+    let started = Instant::now();
+    while fetch_error_count(database).await <= before {
+        assert!(
+            started.elapsed() < SERVER_START_TIMEOUT,
+            "collect saved no fetch errors"
+        );
+        tokio::time::sleep(SERVER_POLL_INTERVAL).await;
+    }
+}
+
+fn terminate(server: &mut RunningServer) {
+    let terminated = Command::new("kill")
+        .arg(TERMINATE_SIGNAL)
+        .arg(server.0.id().to_string())
+        .status()
+        .unwrap();
+    assert!(terminated.success());
+    let status = server.0.wait().unwrap();
+    assert!(status.success(), "collect exited with {status}");
+}
+
+#[tokio::test]
+async fn collect_serves_the_web_page_until_terminated() {
+    let database = TestDatabase::migrated_backup();
+    let errors_before = fetch_error_count(&database.path).await;
+    let address = format!("{LOCALHOST}:{}", free_port());
+    let mut server = collect(&database.path, "enabled", &address, &dead_proxy());
+    let client = local_client();
+
+    let page = get_when_ready(&client, &format!("http://{address}/")).await;
+    assert_eq!(page.status(), reqwest::StatusCode::OK);
+    assert!(page.text().await.unwrap().contains("id=\"stats-all\""));
+    let chart = client
+        .get(format!(
+            "http://{address}/charts/average-speed.svg?range=month"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chart.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        chart.headers()[reqwest::header::CONTENT_TYPE],
+        SVG_CONTENT_TYPE
+    );
+    wait_for_new_fetch_errors(&database.path, errors_before).await;
+    let page = client
+        .get(format!("http://{address}/quality"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let line_list_failures = single_text(
+        &Html::parse_document(&page),
+        "#fetch-failures tr[data-source=mpk-lines] td[data-range=hour]",
+    );
+    assert_eq!(line_list_failures, "100.0%");
+
+    terminate(&mut server);
+}
+
+#[tokio::test]
+async fn collect_without_web_does_not_listen() {
+    let database = TestDatabase::migrated_backup();
+    let errors_before = fetch_error_count(&database.path).await;
+    let address = format!("{LOCALHOST}:{}", free_port());
+    let mut server = collect(&database.path, "disabled", &address, &dead_proxy());
+
+    wait_for_new_fetch_errors(&database.path, errors_before).await;
+    let refused = local_client()
+        .get(format!("http://{address}/"))
+        .send()
+        .await
+        .unwrap_err();
+    assert!(refused.is_connect(), "{refused}");
+
+    terminate(&mut server);
 }
