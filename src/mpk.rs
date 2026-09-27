@@ -21,10 +21,12 @@ pub enum VehicleType {
 impl VehicleType {
     pub const ALL: [VehicleType; 3] = [VehicleType::Bus, VehicleType::Tram, VehicleType::Train];
 
+    #[must_use]
     pub fn id(self) -> i64 {
         self as i64
     }
 
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             VehicleType::Bus => "bus",
@@ -82,6 +84,7 @@ pub struct Position {
 }
 
 impl Position {
+    #[must_use]
     pub fn has_valid_coordinates(&self) -> bool {
         geo::is_plausible_fix(self.latitude, self.longitude)
     }
@@ -213,7 +216,7 @@ mod tests {
         let p = &positions[0];
         assert_eq!(p.vehicle_type, VehicleType::Bus);
         assert_eq!(p.line, "a");
-        assert_eq!(p.course_id, 29073702);
+        assert_eq!(p.course_id, 29_073_702);
         assert_eq!(p.latitude, MicroDegrees(51_148_666));
         assert_eq!(p.longitude, MicroDegrees(17_075_660));
         assert!(p.has_valid_coordinates());

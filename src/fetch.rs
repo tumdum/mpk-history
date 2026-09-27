@@ -17,10 +17,12 @@ pub enum Source {
 }
 
 impl Source {
+    #[must_use]
     pub fn id(self) -> i64 {
         self as i64
     }
 
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Source::MpkLines => "MPK line list",
@@ -43,6 +45,7 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
+    #[must_use]
     pub fn id(self) -> i64 {
         self as i64
     }
@@ -305,7 +308,7 @@ pub mod tests {
         url
     }
 
-    pub fn refused_url() -> String {
+    pub(crate) fn refused_url() -> String {
         let listener = TcpListener::bind(LOCALHOST).unwrap();
         format!("http://{}{PATH}", listener.local_addr().unwrap())
     }
@@ -353,7 +356,7 @@ pub mod tests {
             match self {
                 Failure::Status(status) => assert_eq!(message, format!("HTTP {status}")),
                 Failure::InvalidJson => {
-                    assert!(message.starts_with(INVALID_JSON_PREFIX), "{message}")
+                    assert!(message.starts_with(INVALID_JSON_PREFIX), "{message}");
                 }
                 Failure::Empty => assert_eq!(message, EMPTY_MESSAGE),
             }

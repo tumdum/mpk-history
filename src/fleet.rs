@@ -13,7 +13,7 @@ use crate::open_data::{Client, VehicleRecord};
 
 const MATCH_RADIUS_M: f64 = 20.0;
 pub const TIME_SLACK: Duration = Duration::from_secs(30);
-pub const INFERENCE_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
+pub const INFERENCE_WINDOW: Duration = Duration::from_hours(6);
 
 #[derive(Debug, PartialEq)]
 enum Outcome {
@@ -100,6 +100,7 @@ pub struct FleetCollector {
 }
 
 impl FleetCollector {
+    #[must_use]
     pub fn new(client: Client, db: Db, inference: Option<InferenceSettings>) -> Self {
         Self {
             client,

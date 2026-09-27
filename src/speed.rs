@@ -4,6 +4,7 @@ use crate::geo;
 const MIN_SPAN_SECS: i64 = 20;
 const KMH_PER_METER_PER_SECOND: f64 = 3.6;
 
+#[must_use]
 pub fn average_speed_kmh(
     points: &[PathPoint],
     window_start_unix: i64,
@@ -17,6 +18,8 @@ pub fn average_speed_kmh(
     if span_secs < MIN_SPAN_SECS {
         return None;
     }
+    #[allow(clippy::cast_precision_loss)]
+    let span_secs = span_secs as f64;
     let distance_m = points.windows(2).fold(0.0, |total, pair| {
         total
             + geo::distance_m(
@@ -24,7 +27,7 @@ pub fn average_speed_kmh(
                 (pair[1].latitude, pair[1].longitude),
             )
     });
-    Some(distance_m / span_secs as f64 * KMH_PER_METER_PER_SECOND)
+    Some(distance_m / span_secs * KMH_PER_METER_PER_SECOND)
 }
 
 #[cfg(test)]
@@ -59,7 +62,7 @@ mod tests {
     #[test]
     fn reports_zero_for_a_parked_vehicle() {
         let speed = average_speed_kmh(&[point(0, 0, 100)], 40, 100).unwrap();
-        assert_eq!(speed, 0.0);
+        assert!(speed.abs() < f64::EPSILON);
         assert!(speed.is_sign_positive());
     }
 

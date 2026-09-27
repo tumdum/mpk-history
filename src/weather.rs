@@ -13,6 +13,7 @@ pub struct WeatherCollector {
 }
 
 impl WeatherCollector {
+    #[must_use]
     pub fn new(client: Client, db: Db, area: Area, model: String) -> Self {
         Self {
             client,

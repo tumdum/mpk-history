@@ -124,6 +124,7 @@ pub struct Client {
 }
 
 impl Client {
+    #[must_use]
     pub fn new(http: reqwest::Client) -> Self {
         Self { http }
     }

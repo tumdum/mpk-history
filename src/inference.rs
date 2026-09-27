@@ -29,6 +29,7 @@ fn link_distance_m(
     (distance_m <= settings.max_distance_m).then_some(distance_m)
 }
 
+#[must_use]
 pub fn infer(
     summaries: &[CourseSummary],
     known: &[CourseVehicle],

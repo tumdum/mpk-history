@@ -16,11 +16,12 @@ pub async fn backup(db: &Db, target: &Path) -> Result<()> {
     }
     let started = Instant::now();
     db.backup_to(target).await?;
-    let size = std::fs::metadata(target)?.len();
+    #[allow(clippy::cast_precision_loss)]
+    let megabytes = std::fs::metadata(target)?.len() as f64 / BYTES_PER_MEGABYTE;
     println!(
         "backed up to {} ({:.1} MB) in {:.1} s",
         target.display(),
-        size as f64 / BYTES_PER_MEGABYTE,
+        megabytes,
         started.elapsed().as_secs_f64()
     );
     Ok(())

@@ -141,6 +141,7 @@ pub struct VehicleCollector {
 }
 
 impl VehicleCollector {
+    #[must_use]
     pub fn new(
         client: Client,
         db: Db,
@@ -267,7 +268,7 @@ mod tests {
 
         let third = [position(1, 51.0, 17.0), position(2, 51.2, 17.2)];
         let (new, mut seen_again) = step(&mut tracker, &third, 2 * INTERVAL_SECS, &mut next_id);
-        seen_again.sort();
+        seen_again.sort_unstable();
         assert_eq!((new, seen_again), (0, vec![1, 3]));
     }
 
@@ -326,7 +327,7 @@ mod tests {
 
         let second = [position(1, 51.5, 17.5), position(1, 51.0, 17.0)];
         let (new, mut seen_again) = step(&mut tracker, &second, INTERVAL_SECS, &mut next_id);
-        seen_again.sort();
+        seen_again.sort_unstable();
         assert_eq!((new, seen_again), (0, vec![1, 2]));
     }
 

@@ -126,8 +126,8 @@ impl Client {
         let ambiguous = self.time_zone.to_ambiguous_timestamp(local);
         let mut candidates: Vec<i64> = [ambiguous.earlier(), ambiguous.later()]
             .into_iter()
-            .filter_map(|timestamp| timestamp.ok())
-            .map(|timestamp| timestamp.as_second())
+            .filter_map(std::result::Result::ok)
+            .map(jiff::Timestamp::as_second)
             .collect();
         candidates.sort_unstable();
         candidates.dedup();
@@ -135,6 +135,7 @@ impl Client {
     }
 }
 
+#[must_use]
 pub fn normalize_plate(plate: &str) -> String {
     plate
         .chars()
@@ -208,12 +209,12 @@ mod tests {
 
     #[test]
     fn gives_both_readings_of_a_repeated_or_skipped_local_time() {
-        let client = client();
-        let candidates = |local: &str| client.unix_candidates(local.parse().unwrap());
         const FALL_BACK_0030_UTC: i64 = 1_792_888_200;
         const FALL_BACK_0130_UTC: i64 = 1_792_891_800;
         const SPRING_FORWARD_0030_UTC: i64 = 1_774_744_200;
         const SPRING_FORWARD_0130_UTC: i64 = 1_774_747_800;
+        let client = client();
+        let candidates = |local: &str| client.unix_candidates(local.parse().unwrap());
         assert_eq!(
             candidates("2026-10-25T02:30:00"),
             [FALL_BACK_0030_UTC, FALL_BACK_0130_UTC]

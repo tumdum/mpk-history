@@ -1,9 +1,10 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 
@@ -14,7 +15,7 @@ use crate::open_meteo::GridPoint;
 
 const MAX_CONNECTIONS: u32 = 1;
 
-pub const MAX_ROW_SPAN: Duration = Duration::from_secs(10 * 60);
+pub const MAX_ROW_SPAN: Duration = Duration::from_mins(10);
 
 pub enum OpenMode {
     CreateIfMissing,
@@ -74,6 +75,7 @@ pub enum MatchSource {
 impl MatchSource {
     pub const ALL: [MatchSource; 2] = [MatchSource::Matched, MatchSource::Inferred];
 
+    #[must_use]
     pub fn id(self) -> i64 {
         self as i64
     }
@@ -293,7 +295,7 @@ impl Db {
             new_ids.push(row_id);
         }
         tx.commit().await?;
-        self.lock_line_ids().extend(added_lines);
+        self.line_ids.lock().extend(added_lines);
         Ok(new_ids)
     }
 
@@ -304,7 +306,7 @@ impl Db {
         added_lines: &mut HashMap<LineKey, i64>,
     ) -> Result<i64> {
         let key = (position.vehicle_type, position.line.clone());
-        let cached = self.lock_line_ids().get(&key).copied();
+        let cached = self.line_ids.lock().get(&key).copied();
         if let Some(line_id) = cached.or_else(|| added_lines.get(&key).copied()) {
             return Ok(line_id);
         }
@@ -321,12 +323,6 @@ impl Db {
                 .await?;
         added_lines.insert(key, line_id);
         Ok(line_id)
-    }
-
-    fn lock_line_ids(&self) -> std::sync::MutexGuard<'_, HashMap<LineKey, i64>> {
-        self.line_ids
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub async fn save_weather(
@@ -809,6 +805,7 @@ async fn delete_inferred_subtree(conn: &mut SqliteConnection, course_id: i64) ->
     .rows_affected())
 }
 
+#[must_use]
 pub fn duration_secs(duration: Duration) -> i64 {
     i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
 }
@@ -1090,6 +1087,7 @@ mod tests {
 
     #[tokio::test]
     async fn corrects_chain_when_direct_match_differs() {
+        use MatchSource::{Inferred, Matched};
         let (db, line) = db_with_line().await;
         db.save_course_vehicles(&[
             course_vehicle(line, 10, 1000),
@@ -1112,7 +1110,6 @@ mod tests {
                 removed: 0
             }
         );
-        use MatchSource::{Inferred, Matched};
         assert_eq!(
             chain_state(&db, &[10, 11, 12, 13]).await,
             [
@@ -1221,6 +1218,15 @@ mod tests {
 
     #[tokio::test]
     async fn stores_fetch_errors() {
+        type Row = (
+            i64,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            String,
+        );
         let db = open().await;
         let url = crate::fetch::tests::refused_url();
         let error = crate::fetch::send(
@@ -1231,16 +1237,6 @@ mod tests {
         .err()
         .unwrap();
         db.save_fetch_error(&error).await.unwrap();
-
-        type Row = (
-            i64,
-            i64,
-            i64,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-            String,
-        );
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT source, kind, started_unix, method, url, http_status, message \
                  FROM fetch_errors",

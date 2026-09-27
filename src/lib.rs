@@ -1,3 +1,11 @@
+#![deny(
+    clippy::all,
+    clippy::pedantic,
+    clippy::unwrap_used,
+    clippy::expect_used
+)]
+#![allow(clippy::missing_errors_doc)]
+
 pub mod backup;
 pub mod build_info;
 pub mod collector;

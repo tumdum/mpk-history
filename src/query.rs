@@ -156,7 +156,10 @@ pub async fn print_bounding_box(
     }
     let range = describe_range(from, to)?;
     let Some(bbox) = db
-        .bounding_box(from.map(|t| t.as_second()), to.map(|t| t.as_second()))
+        .bounding_box(
+            from.map(jiff::Timestamp::as_second),
+            to.map(jiff::Timestamp::as_second),
+        )
         .await?
     else {
         println!("no positions {range}");
@@ -196,7 +199,7 @@ fn height_km(bbox: &BoundingBox) -> f64 {
 }
 
 fn width_km(bbox: &BoundingBox) -> f64 {
-    let middle_latitude = (bbox.north.degrees() + bbox.south.degrees()) / 2.0;
+    let middle_latitude = f64::midpoint(bbox.north.degrees(), bbox.south.degrees());
     (bbox.east.degrees() - bbox.west.degrees())
         * KM_PER_DEGREE_LATITUDE
         * middle_latitude.to_radians().cos()

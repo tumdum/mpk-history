@@ -1560,6 +1560,7 @@ dependencies = [
  "criterion",
  "jiff",
  "liblzma",
+ "parking_lot",
  "reqwest",
  "rstest",
  "scraper",
