@@ -33,6 +33,7 @@ from is described in [data-sources.md](data-sources.md).
 | `*_e6` | Coordinate in microdegrees (degrees × 1,000,000), as an integer | `51148666` = 51.148666° |
 | `*_unix` | UTC Unix time in seconds | `first_seen_unix` |
 | `*_secs` | Duration in seconds | `seen_for_secs` |
+| `*_ms` | Duration in milliseconds | `elapsed_ms` |
 | `*_m` | Distance in metres | `distance_m` |
 
 Integers instead of floats keep rows small, and microdegrees are more precise than the
@@ -43,6 +44,8 @@ integers:
 |---|---|
 | `lines.vehicle_type` | `0` bus, `1` tram, `2` train |
 | `course_vehicles.source` | `0` matched directly, `1` inferred |
+| `fetch_errors.source` | `0` MPK line list, `1` MPK positions, `2` Open-Meteo, `3` open data fleet |
+| `fetch_errors.kind` | `0` timeout, `1` connect, `2` other request error, `3` HTTP status, `4` body read, `5` invalid response, `6` empty response |
 
 ## Tables
 
@@ -84,6 +87,17 @@ erDiagram
         INTEGER observed_unix
         INTEGER fetched_unix
         REAL temperature_2m
+    }
+    fetch_errors {
+        INTEGER id PK
+        INTEGER source
+        INTEGER kind
+        INTEGER started_unix
+        INTEGER elapsed_ms
+        TEXT url
+        INTEGER http_status
+        TEXT response_body
+        TEXT message
     }
 ```
 
@@ -199,6 +213,40 @@ Index: `UNIQUE (model, observed_unix, latitude_e6, longitude_e6)`. It also stops
 same value from being stored twice after a restart (`INSERT OR IGNORE`). Queries by
 time should include `model = '…'` to use this index.
 
+### `fetch_errors`
+
+One row per failed download from any external source. The collector saves the row and
+then logs the same error as a warning. Errors of our own code or of the database are
+not stored here, only problems with a request or its response.
+
+| Column | Meaning |
+|---|---|
+| `source` | Which download failed, see the enum values above |
+| `kind` | What went wrong, see below |
+| `started_unix` | When the request was started |
+| `elapsed_ms` | Time from the start until the failure, or until the whole body was read |
+| `method`, `url` | HTTP method and the full URL with its query. `NULL` only when the request could not be built |
+| `request_body` | Form body sent, e.g. the MPK line list. `NULL` for `GET` |
+| `http_status` | Status code. `NULL` when no response came |
+| `response_headers` | Response headers, one `name: value` per line. `NULL` when no response came |
+| `response_bytes` | Full size of the response body. `NULL` when the body was not read |
+| `response_body` | First 16 KiB of the response body |
+| `message` | The error text, as in the log |
+
+`request_body` is also cut to 16 KiB. Kinds:
+
+| `kind` | Meaning | Response columns |
+|---|---|---|
+| `0` timeout | No full answer in 30 s | status and headers if they came before the timeout |
+| `1` connect | DNS, TCP or TLS failed | `NULL` |
+| `2` request | Any other error while sending | `NULL` |
+| `3` HTTP status | Status is not 2xx | set |
+| `4` body read | The connection broke while reading the body, or it could not be decompressed | status and headers |
+| `5` invalid response | The body is not the JSON we expect | set |
+| `6` empty response | The map page has no lines | set |
+
+Index: `fetch_errors_source_started (source, started_unix)`.
+
 ## Indexes and queries
 
 | Query | Index used |
@@ -239,6 +287,7 @@ GROUP BY day;
 | `0010_course_vehicles_plate` | Plate index, `line_id` in `course_vehicles` | |
 | `0011_lines_name_index` | Index on line name | |
 | `0012_inferred_course_vehicles` | `source` and `inferred_from_course_id` | |
+| `0013_fetch_errors` | Failed downloads table | |
 
 Before starting a new binary whose new migrations **rebuild a table**, stop the
 running collector. An old collector writing into a rebuilt table fails on every fetch.
@@ -305,6 +354,21 @@ ORDER BY trip_start;
 
 Join `vehicle_positions` on **both** `line_id` and `course_id`. Joining on `course_id`
 alone can't use an index and reads the whole table.
+
+### Failed downloads per source and day
+
+```sql
+SELECT date(started_unix, 'unixepoch', 'localtime') AS day,
+       CASE source WHEN 0 THEN 'lines' WHEN 1 THEN 'positions'
+                   WHEN 2 THEN 'weather' WHEN 3 THEN 'fleet' END AS source,
+       kind,
+       http_status,
+       COUNT(*) AS errors,
+       MAX(message) AS example
+FROM fetch_errors
+GROUP BY day, source, kind, http_status
+ORDER BY day, source;
+```
 
 ### Weather at a vehicle's position
 

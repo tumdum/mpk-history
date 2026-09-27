@@ -435,6 +435,9 @@ async fn migrations_apply_to_the_backup_and_keep_every_row() {
     let db = open(&database.path).await;
     let after = table_row_counts(&db).await;
     for (table, rows) in &before {
+        if table == MIGRATIONS_TABLE {
+            continue;
+        }
         assert_eq!(
             after.get(table),
             Some(rows),

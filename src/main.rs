@@ -2,6 +2,8 @@ mod backup;
 mod build_info;
 mod collector;
 mod db;
+mod fetch;
+mod fetch_errors;
 mod fleet;
 mod geo;
 mod inference;
@@ -267,7 +269,7 @@ async fn collect(
 
     let vehicle_interval = Duration::from_secs(vehicle_args.interval_secs);
     let mut vehicles = VehicleCollector::new(
-        mpk::Client::new(http.clone()),
+        mpk::Client::new(http.clone())?,
         db.clone(),
         vehicle_interval,
         Duration::from_secs(vehicle_args.lines_refresh_secs),

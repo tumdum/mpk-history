@@ -5,6 +5,7 @@ use anyhow::Result;
 use tracing::{debug, info, warn};
 
 use crate::db::{self, Db};
+use crate::fetch_errors;
 use crate::geo::{self, MicroDegrees};
 use crate::mpk::{Client, Line, Position, VehicleType};
 
@@ -169,7 +170,9 @@ impl VehicleCollector {
             debug!("already saved positions in this second, skipping");
             return Ok(());
         }
-        let mut positions = self.client.fetch_positions(&self.lines).await?;
+        let mut positions =
+            fetch_errors::recorded(&self.db, self.client.fetch_positions(&self.lines).await)
+                .await?;
         let fetched = positions.len();
         positions.retain(Position::has_valid_coordinates);
         let matches = self.tracker.match_positions(&positions, now_unix);
@@ -180,7 +183,7 @@ impl VehicleCollector {
         self.last_saved_unix = Some(now_unix);
         info!(
             total = fetched,
-            invalid = fetched - positions.len(),
+            invalid_gps = fetched - positions.len(),
             new = matches.new.len(),
             unchanged = matches.seen_again.len(),
             "saved positions"
@@ -196,7 +199,7 @@ impl VehicleCollector {
         if fresh {
             return;
         }
-        match self.client.fetch_lines().await {
+        match fetch_errors::recorded(&self.db, self.client.fetch_lines().await).await {
             Ok(lines) => {
                 info!(count = lines.len(), "fetched line list");
                 self.lines = lines;

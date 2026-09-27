@@ -6,6 +6,7 @@ use jiff::civil;
 use tracing::info;
 
 use crate::db::{self, ActivePosition, CourseVehicle, Db, MatchSource};
+use crate::fetch_errors;
 use crate::geo;
 use crate::inference::{self, InferenceSettings};
 use crate::open_data::{Client, VehicleRecord};
@@ -109,7 +110,7 @@ impl FleetCollector {
     }
 
     pub async fn collect(&mut self) -> Result<()> {
-        let records = self.client.fetch_vehicles().await?;
+        let records = fetch_errors::recorded(&self.db, self.client.fetch_vehicles().await).await?;
         let mut counts = Counts::default();
         let mut vehicles = Vec::new();
         for record in &records {

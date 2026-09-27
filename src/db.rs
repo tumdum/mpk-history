@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 
+use crate::fetch::FetchError;
 use crate::geo::MicroDegrees;
 use crate::mpk::{Position, VehicleType};
 use crate::open_meteo::GridPoint;
@@ -368,6 +369,33 @@ impl Db {
         }
         tx.commit().await?;
         Ok(inserted)
+    }
+
+    pub async fn save_fetch_error(&self, error: &FetchError) -> Result<()> {
+        let attempt = &error.attempt;
+        let response = error.response.as_ref();
+        let body = response.and_then(|response| response.body.as_ref());
+        sqlx::query(
+            "INSERT INTO fetch_errors \
+             (source, kind, started_unix, elapsed_ms, method, url, request_body, http_status, \
+              response_headers, response_bytes, response_body, message) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(attempt.source.id())
+        .bind(error.kind.id())
+        .bind(attempt.started_unix)
+        .bind(i64::try_from(error.elapsed.as_millis()).unwrap_or(i64::MAX))
+        .bind(&attempt.method)
+        .bind(&attempt.url)
+        .bind(&attempt.request_body)
+        .bind(response.map(|response| i64::from(response.status.as_u16())))
+        .bind(response.map(|response| response.headers.as_str()))
+        .bind(body.map(|body| i64::try_from(body.total_bytes).unwrap_or(i64::MAX)))
+        .bind(body.map(|body| body.text.as_str()))
+        .bind(&error.message)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn positions_at(
@@ -1189,6 +1217,49 @@ mod tests {
         );
         let clipped = db.course_summaries(1_000 - span + 1, 2_000).await.unwrap();
         assert!(!clipped[0].start_is_complete);
+    }
+
+    #[tokio::test]
+    async fn stores_fetch_errors() {
+        let db = open().await;
+        let url = crate::fetch::tests::refused_url();
+        let error = crate::fetch::send(
+            crate::fetch::Source::OpenData,
+            reqwest::Client::new().get(&url),
+        )
+        .await
+        .err()
+        .unwrap();
+        db.save_fetch_error(&error).await.unwrap();
+
+        type Row = (
+            i64,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            String,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT source, kind, started_unix, method, url, http_status, message \
+                 FROM fetch_errors",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            [(
+                crate::fetch::Source::OpenData.id(),
+                crate::fetch::ErrorKind::Connect.id(),
+                error.attempt.started_unix,
+                Some("GET".to_owned()),
+                Some(url),
+                None,
+                error.message,
+            )]
+        );
     }
 
     #[tokio::test]

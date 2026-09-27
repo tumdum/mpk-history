@@ -18,6 +18,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 liblzma = { version = "0.4.8", features = ["static"] }
+rstest = { version = "0.27.0", default-features = false }
 serde_json = "1.0.151"
 tempfile = "3.27.0"
 

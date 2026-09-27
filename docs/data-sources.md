@@ -12,8 +12,10 @@ How the result is stored is described in [database.md](database.md).
 | Open-Meteo | `https://api.open-meteo.com/v1/forecast` | Weather on a grid over the city | 30 min (`--weather-interval-secs`) | `src/open_meteo.rs`, `src/weather.rs` |
 | Wrocław open data | `https://open-data.cui.wroclaw.pl/hdb/db/14?download=json` | Side number, plate and brigade of each vehicle | 15 min (`--fleet-interval-secs`) | `src/open_data.rs`, `src/fleet.rs`, `src/inference.rs` |
 
-All HTTP requests share one client with a 30 s timeout. A failed request only logs a
-warning; the loop tries again at its next tick.
+All HTTP requests share one client with a 30 s timeout (`src/fetch.rs`). A failed
+request is saved in the `fetch_errors` table with its URL, status, headers and the
+start of the body (see [database.md](database.md#fetch_errors)), and logged as a
+warning. The loop tries again at its next tick.
 
 ## MPK line list
 
@@ -75,7 +77,7 @@ Things to know about this data:
   more than 6 decimals.
 - **Bad positions.** About 0.3% of positions are GPS junk: values outside ±90° / ±180°
   (often `7158.279` for both coordinates) or exactly `0, 0`. They are never stored
-  (`geo::is_plausible_fix`), only counted as `invalid` in the log. Bad positions stored
+  (`geo::is_plausible_fix`), only counted as `invalid_gps` in the log. Bad positions stored
   by early versions were deleted once, by migrations `0004` and `0006`.
 - **Shared course IDs.** Sometimes two vehicles report the same line and course ID at
   the same time, at different positions. Both are stored, each in its own rows.
@@ -147,7 +149,7 @@ box contains only one point, the response is a single object; both shapes are ha
   hPa, km/h, degrees.
 - Any value can be `null` and is then stored as `NULL`.
 - On an error, Open-Meteo returns `{"error": true, "reason": "…"}`. The reason is
-  written to the log.
+  added to the error message in the log and in `fetch_errors.message`.
 
 ### Rate limit
 

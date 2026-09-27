@@ -4,6 +4,7 @@ use std::str::FromStr;
 use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 
+use crate::fetch::{self, FetchError, Source};
 use crate::geo::{self, MicroDegrees};
 
 const FORECAST_URL: &str = "https://api.open-meteo.com/v1/forecast";
@@ -127,30 +128,29 @@ impl Client {
         Self { http }
     }
 
-    pub async fn fetch_current(&self, area: &Area, model: &str) -> Result<Vec<GridPoint>> {
+    pub async fn fetch_current(
+        &self,
+        area: &Area,
+        model: &str,
+    ) -> Result<Vec<GridPoint>, FetchError> {
         let variables = CURRENT_VARIABLES.join(",");
         let bounding_box = area.to_string();
-        let response = self
-            .http
-            .get(FORECAST_URL)
-            .query(&[
-                ("current", variables.as_str()),
-                ("bounding_box", bounding_box.as_str()),
-                ("models", model),
-                ("timeformat", TIME_FORMAT),
-                ("forecast_days", FORECAST_DAYS),
-            ])
-            .send()
-            .await?;
-        let status = response.status();
-        let body = response.text().await?;
-        if !status.is_success() {
-            let reason = serde_json::from_str::<ErrorBody>(&body)
-                .map(|error| error.reason)
-                .unwrap_or(body);
-            bail!("open-meteo returned {status}: {reason}");
-        }
-        let points = match serde_json::from_str(&body)? {
+        let request = self.http.get(FORECAST_URL).query(&[
+            ("current", variables.as_str()),
+            ("bounding_box", bounding_box.as_str()),
+            ("models", model),
+            ("timeformat", TIME_FORMAT),
+            ("forecast_days", FORECAST_DAYS),
+        ]);
+        let response = fetch::send(Source::OpenMeteo, request)
+            .await?
+            .require_success_with_reason(|body| {
+                serde_json::from_str::<ErrorBody>(body)
+                    .ok()
+                    .map(|error| error.reason)
+            })?
+            .json()?;
+        let points = match response {
             Response::Many(points) => points,
             Response::One(point) => vec![point],
         };

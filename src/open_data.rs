@@ -4,6 +4,7 @@ use jiff::tz::TimeZone;
 use serde::Deserialize;
 use tracing::warn;
 
+use crate::fetch::{self, FetchError, Source};
 use crate::geo::{self, MicroDegrees};
 
 const VEHICLES_URL: &str = "https://open-data.cui.wroclaw.pl/hdb/db/14?download=json";
@@ -66,16 +67,11 @@ impl Client {
         Ok(Self { http, time_zone })
     }
 
-    pub async fn fetch_vehicles(&self) -> Result<Vec<VehicleRecord>> {
-        let dataset: Dataset = self
-            .http
-            .get(VEHICLES_URL)
-            .send()
+    pub async fn fetch_vehicles(&self) -> Result<Vec<VehicleRecord>, FetchError> {
+        let dataset: Dataset = fetch::send(Source::OpenData, self.http.get(VEHICLES_URL))
             .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context("invalid open data vehicles response")?;
+            .require_success()?
+            .json()?;
         Ok(self.on_route(dataset.entries))
     }
 

@@ -1,8 +1,9 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use scraper::{Html, Selector};
 use serde::Deserialize;
 use tracing::warn;
 
+use crate::fetch::{self, ErrorKind, FetchError, Source};
 use crate::geo::{self, MicroDegrees};
 
 const MAP_PAGE_URL: &str =
@@ -93,46 +94,53 @@ enum Entry {
     Unrecognized(serde_json::Value),
 }
 
+type LineSelectors = Vec<(VehicleType, Selector)>;
+
 pub struct Client {
     http: reqwest::Client,
+    line_selectors: LineSelectors,
 }
 
 impl Client {
-    pub fn new(http: reqwest::Client) -> Self {
-        Self { http }
+    pub fn new(http: reqwest::Client) -> Result<Self> {
+        let line_selectors = VehicleType::ALL
+            .into_iter()
+            .map(|vehicle_type| {
+                Selector::parse(vehicle_type.lines_selector())
+                    .map(|selector| (vehicle_type, selector))
+                    .map_err(|e| anyhow!("invalid selector: {e}"))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            http,
+            line_selectors,
+        })
     }
 
-    pub async fn fetch_lines(&self) -> Result<Vec<Line>> {
-        let html = self
-            .http
-            .get(MAP_PAGE_URL)
-            .send()
+    pub async fn fetch_lines(&self) -> Result<Vec<Line>, FetchError> {
+        let fetched = fetch::send(Source::MpkLines, self.http.get(MAP_PAGE_URL))
             .await?
-            .error_for_status()?
-            .text()
-            .await?;
-        let lines = parse_lines(&html)?;
+            .require_success()?;
+        let lines = parse_lines(&fetched.body, &self.line_selectors);
         if lines.is_empty() {
-            return Err(anyhow!("no lines found on {MAP_PAGE_URL}"));
+            return Err(fetched.error(
+                ErrorKind::Empty,
+                format!("no lines found on {MAP_PAGE_URL}"),
+            ));
         }
         Ok(lines)
     }
 
-    pub async fn fetch_positions(&self, lines: &[Line]) -> Result<Vec<Position>> {
+    pub async fn fetch_positions(&self, lines: &[Line]) -> Result<Vec<Position>, FetchError> {
         let form: Vec<(&str, &str)> = lines
             .iter()
             .map(|line| (line.vehicle_type.form_key(), line.name.as_str()))
             .collect();
-        let entries: Vec<Entry> = self
-            .http
-            .post(POSITIONS_URL)
-            .form(&form)
-            .send()
+        let request = self.http.post(POSITIONS_URL).form(&form);
+        let entries: Vec<Entry> = fetch::send(Source::MpkPositions, request)
             .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context("invalid positions response")?;
+            .require_success()?
+            .json()?;
         Ok(split_entries(entries))
     }
 }
@@ -152,21 +160,22 @@ fn split_entries(entries: Vec<Entry>) -> Vec<Position> {
     positions
 }
 
-fn parse_lines(html: &str) -> Result<Vec<Line>> {
+fn parse_lines(html: &str, selectors: &LineSelectors) -> Vec<Line> {
     let document = Html::parse_document(html);
     let mut lines = Vec::new();
-    for vehicle_type in VehicleType::ALL {
-        let selector = Selector::parse(vehicle_type.lines_selector())
-            .map_err(|e| anyhow!("invalid selector: {e}"))?;
-        for element in document.select(&selector) {
+    for (vehicle_type, selector) in selectors {
+        for element in document.select(selector) {
             let name = element.text().collect::<String>().trim().to_lowercase();
             if name.is_empty() {
                 continue;
             }
-            lines.push(Line { vehicle_type, name });
+            lines.push(Line {
+                vehicle_type: *vehicle_type,
+                name,
+            });
         }
     }
-    Ok(lines)
+    lines
 }
 
 #[cfg(test)]
@@ -180,7 +189,8 @@ mod tests {
             <div id="tramwaje" class="bus-gps-lines tram"><ul><li class="line">0</li><li class="line"> </li></ul></div>
             <div class="bus-gps-lines train"><ul><li class="line">S1</li></ul></div>
         "#;
-        let lines = parse_lines(html).unwrap();
+        let client = Client::new(reqwest::Client::new()).unwrap();
+        let lines = parse_lines(html, &client.line_selectors);
         let got: Vec<_> = lines
             .iter()
             .map(|l| (l.vehicle_type, l.name.as_str()))
