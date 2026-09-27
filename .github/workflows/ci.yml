@@ -26,6 +26,8 @@ jobs:
         id: chrome
         with:
           install-chromedriver: true
+      - name: Allow Chrome sandbox to use user namespaces
+        run: sudo sysctl --quiet --write kernel.apparmor_restrict_unprivileged_userns=0
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -113,6 +115,8 @@ jobs:
         id: chrome
         with:
           install-chromedriver: true
+      - name: Allow Chrome sandbox to use user namespaces
+        run: sudo sysctl --quiet --write kernel.apparmor_restrict_unprivileged_userns=0
       - name: Compute coverage
         run: cargo llvm-cov --locked --html --output-dir ${{ env.COVERAGE_DIR }}
         env:
