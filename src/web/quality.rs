@@ -515,12 +515,7 @@ pub(super) async fn overview(
             h1 { (heading) }
             p #updated { "As of " (updated(now, &state.tz)) }
         }
-        (selection::vehicles_nav(&selection, page, &lines))
         main {
-            section #summary {
-                h2 { "Summary" }
-                (range_tables(&selection, &quality, &position_subjects))
-            }
             section #charts {
                 h2 { "Charts" }
                 nav aria-label="Chart range" {
@@ -534,6 +529,11 @@ pub(super) async fn overview(
                 @for figure in &figures {
                     (figure)
                 }
+            }
+            (selection::vehicles_nav(&selection, page, &lines))
+            section #summary {
+                h2 { "Summary" }
+                (range_tables(&selection, &quality, &position_subjects))
             }
             (selection::lines_section(&selection, page, &lines))
         }
@@ -596,6 +596,14 @@ pub(super) async fn period_page(
             @if in_progress {
                 p #updated { "So far, as of " (updated(now, &state.tz)) }
             }
+        }
+        main {
+            section #charts {
+                h2 { "Charts" }
+                @for figure in &figures {
+                    (figure)
+                }
+            }
             (selection::vehicles_nav(&selection, page, &lines))
             nav .period-nav aria-label="Neighbouring periods" {
                 a #previous rel="prev" href=(selection.period_quality_path(previous)) { "← Previous " (noun) }
@@ -603,17 +611,9 @@ pub(super) async fn period_page(
                     a #next rel="next" href=(selection.period_quality_path(next)) { "Next " (noun) " →" }
                 }
             }
-        }
-        main {
             section #summary {
                 h2 { "Summary" }
                 (period_tables(&selection, &quality, &position_subjects))
-            }
-            section #charts {
-                h2 { "Charts" }
-                @for figure in &figures {
-                    (figure)
-                }
             }
             @if let Some(part) = parts.first() {
                 section #parts {

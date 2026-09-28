@@ -294,7 +294,7 @@ impl Metric {
         Metric::PeakVehicles,
         Metric::Distance,
     ];
-    const CHARTED: [Metric; 2] = [Metric::AverageVehicles, Metric::AverageSpeed];
+    const CHARTED: [Metric; 2] = [Metric::AverageSpeed, Metric::AverageVehicles];
 
     fn slug(self) -> &'static str {
         match self {
@@ -904,22 +904,7 @@ async fn overview(
             h1 { (heading) }
             p #updated { "As of " (updated(now, &state.tz)) }
         }
-        (selection::vehicles_nav(&selection, page, &lines))
-        nav #history aria-label="History" {
-            @for (label, period) in &history {
-                a href=(selection.period_path(*period)) { (label) }
-            }
-        }
-        nav #pages aria-label="Pages" {
-            a #quality-link href=(selection.quality_path()) { "Data quality" }
-        }
         main {
-            section #summary {
-                h2 { "Summary" }
-                @for (subject, rows) in &tables {
-                    (range_table(subject, rows))
-                }
-            }
             section #charts {
                 h2 { "Charts" }
                 nav aria-label="Chart range" {
@@ -932,6 +917,21 @@ async fn overview(
                 }
                 @for figure in &figures {
                     (figure)
+                }
+            }
+            (selection::vehicles_nav(&selection, page, &lines))
+            nav #history aria-label="History" {
+                @for (label, period) in &history {
+                    a href=(selection.period_path(*period)) { (label) }
+                }
+            }
+            nav #pages aria-label="Pages" {
+                a #quality-link href=(selection.quality_path()) { "Data quality" }
+            }
+            section #summary {
+                h2 { "Summary" }
+                @for (subject, rows) in &tables {
+                    (range_table(subject, rows))
                 }
             }
             (selection::lines_section(&selection, page, &lines))
@@ -1052,6 +1052,14 @@ async fn period_page(
             @if in_progress {
                 p #updated { "So far, as of " (updated(now, &state.tz)) }
             }
+        }
+        main {
+            section #charts {
+                h2 { "Charts" }
+                @for figure in &figures {
+                    (figure)
+                }
+            }
             (selection::vehicles_nav(&selection, page, &lines))
             nav .period-nav aria-label="Neighbouring periods" {
                 a #previous rel="prev" href=(selection.period_path(previous)) { "← Previous " (noun) }
@@ -1060,17 +1068,9 @@ async fn period_page(
                 }
                 a #quality-link href=(selection.period_quality_path(period)) { "Data quality" }
             }
-        }
-        main {
             section #summary {
                 h2 { "Summary" }
                 (period_table(&shown))
-            }
-            section #charts {
-                h2 { "Charts" }
-                @for figure in &figures {
-                    (figure)
-                }
             }
             @if let Some(part) = parts.first() {
                 section #parts {
@@ -1674,7 +1674,7 @@ mod tests {
         );
         assert_eq!(
             select_attributes(&html, "figure.chart", "id"),
-            ["chart-average-vehicles", "chart-average-speed"]
+            ["chart-average-speed", "chart-average-vehicles"]
         );
         assert_eq!(
             select_attributes(&html, "figure.chart", "data-range"),
@@ -1685,6 +1685,25 @@ mod tests {
             2
         );
         assert!(select_texts(&html, "body > script")[0].contains("chart-data"));
+    }
+
+    #[tokio::test]
+    async fn every_page_starts_with_its_charts() {
+        let db = db_with_a_bus().await;
+        let day = containing(PeriodKind::Day).slug();
+        for uri in [
+            "/".to_owned(),
+            format!("/day/{day}"),
+            "/quality".to_owned(),
+            format!("/day/{day}/quality"),
+        ] {
+            let html = get(&db, &uri).await.body;
+            assert_eq!(
+                select_attributes(&html, "main > *:first-child", "id"),
+                ["charts"],
+                "{uri}"
+            );
+        }
     }
 
     fn hover_data(html: &str, chart: &str) -> serde_json::Value {

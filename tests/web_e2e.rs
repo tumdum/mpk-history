@@ -271,7 +271,7 @@ async fn assert_charts_of(driver: &WebDriver, range: &str) -> WebDriverResult<()
     let figures = driver.find_all(By::Css("figure.chart")).await?;
     assert_eq!(
         attributes(figures.clone(), "id").await?,
-        ["chart-average-vehicles", "chart-average-speed"]
+        ["chart-average-speed", "chart-average-vehicles"]
     );
     assert_eq!(
         attributes(figures.clone(), "data-range").await?,

@@ -28,12 +28,13 @@ once. The web page shares the database connection with the collector. It reads r
 | `/year/2026` | One calendar year |
 | `/quality?range=…` | Data quality: failed downloads and invalid GPS positions |
 | `/day/2026-09-27/quality`, `/week/…/quality`, … | Data quality of one calendar period |
-| `/charts/average-vehicles.svg?range=…` | The average active vehicles chart as a plain SVG image |
 | `/charts/average-speed.svg?range=…` | The average speed chart as a plain SVG image |
+| `/charts/average-vehicles.svg?range=…` | The average active vehicles chart as a plain SVG image |
 
 An unknown `range` gives `400`, an unknown chart `404`. A period in any other form,
 like `/day/2026-9-27` or `/week/2026-W54`, gives `404`. Charts are drawn on the server
-with `plotters`.
+with `plotters`. Every page starts with its charts, average speed first, then the
+navigation links and the tables.
 
 Chart colors are chosen so that every pair of lines in a chart stays apart for the
 common kinds of color blindness, since any two lines can cross. The vehicle charts use
