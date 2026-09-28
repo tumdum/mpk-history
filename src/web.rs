@@ -21,11 +21,13 @@ use crate::db::{self, Db};
 use crate::mpk::VehicleType;
 use crate::stats::{self, Detail, Group, Kind, Retention, StatsCache, TimedTotals, Totals};
 
+mod caching;
 mod i18n;
 mod period;
 mod quality;
 mod selection;
 
+use caching::{Caching, IfNoneMatch, Revision};
 use i18n::{ChartTime, Language, Neighbour, Relative, Text, Translation, capitalized};
 use period::{Period, PeriodKind};
 use quality::{OVERVIEW_QUALITY_PATH, QUALITY_SEGMENT};
@@ -420,6 +422,7 @@ struct AppState {
     history: Arc<StatsCache>,
     clock: Clock,
     tz: TimeZone,
+    revision: Revision,
 }
 
 impl AppState {
@@ -443,6 +446,7 @@ impl AppState {
             )),
             clock,
             tz: TimeZone::system(),
+            revision: Revision::current(),
         }
     }
 
@@ -657,8 +661,16 @@ fn app(state: AppState) -> Router {
                 get(
                     move |State(state): State<AppState>,
                           language: Language,
+                          if_none_match: IfNoneMatch,
                           Path(slug): Path<String>| {
-                        period_page(state, language, SelectionKey::All, kind, slug)
+                        period_page(
+                            state,
+                            language,
+                            if_none_match,
+                            SelectionKey::All,
+                            kind,
+                            slug,
+                        )
                     },
                 ),
             )
@@ -667,8 +679,16 @@ fn app(state: AppState) -> Router {
                 get(
                     move |State(state): State<AppState>,
                           language: Language,
+                          if_none_match: IfNoneMatch,
                           Path(slug): Path<String>| {
-                        quality::period_page(state, language, SelectionKey::All, kind, slug)
+                        quality::period_page(
+                            state,
+                            language,
+                            if_none_match,
+                            SelectionKey::All,
+                            kind,
+                            slug,
+                        )
                     },
                 ),
             );
@@ -796,10 +816,12 @@ fn vehicle_type_period_routes(
                 get(
                     move |State(state): State<AppState>,
                           language: Language,
+                          if_none_match: IfNoneMatch,
                           Path(slug): Path<String>| {
                         period_page(
                             state,
                             language,
+                            if_none_match,
                             SelectionKey::Type(vehicle_type),
                             kind,
                             slug,
@@ -812,10 +834,12 @@ fn vehicle_type_period_routes(
                 get(
                     move |State(state): State<AppState>,
                           language: Language,
+                          if_none_match: IfNoneMatch,
                           Path((line, slug)): Path<(String, String)>| {
                         period_page(
                             state,
                             language,
+                            if_none_match,
                             SelectionKey::Line(vehicle_type, line),
                             kind,
                             slug,
@@ -828,10 +852,12 @@ fn vehicle_type_period_routes(
                 get(
                     move |State(state): State<AppState>,
                           language: Language,
+                          if_none_match: IfNoneMatch,
                           Path(slug): Path<String>| {
                         quality::period_page(
                             state,
                             language,
+                            if_none_match,
                             SelectionKey::Type(vehicle_type),
                             kind,
                             slug,
@@ -844,10 +870,12 @@ fn vehicle_type_period_routes(
                 get(
                     move |State(state): State<AppState>,
                           language: Language,
+                          if_none_match: IfNoneMatch,
                           Path((line, slug)): Path<(String, String)>| {
                         quality::period_page(
                             state,
                             language,
+                            if_none_match,
                             SelectionKey::Line(vehicle_type, line),
                             kind,
                             slug,
@@ -987,7 +1015,7 @@ async fn overview(
         Selection::All => heading,
         Selection::Type(_) | Selection::Line(_) => page_title(tr, &heading),
     };
-    Ok(shell(language, &title, &body))
+    Ok(shell(language, Caching::live()?, &title, &body))
 }
 
 fn history_links(today: Date) -> Result<Vec<(Relative, Period)>> {
@@ -1018,7 +1046,7 @@ fn updated(now: Timestamp, tz: &TimeZone) -> Markup {
     html! { time datetime=(now.to_string()) { (local) } }
 }
 
-fn shell(language: Language, title: &str, body: &Markup) -> Response {
+fn shell(language: Language, caching: Caching, title: &str, body: &Markup) -> Response {
     let markup = html! {
         (DOCTYPE)
         html lang=(language.tag()) {
@@ -1034,7 +1062,7 @@ fn shell(language: Language, title: &str, body: &Markup) -> Response {
             }
         }
     };
-    (language_headers(language), markup).into_response()
+    (language_headers(language), caching, markup).into_response()
 }
 
 fn language_headers(language: Language) -> [(header::HeaderName, HeaderValue); 2] {
@@ -1053,6 +1081,7 @@ fn language_headers(language: Language) -> [(header::HeaderName, HeaderValue); 2
 async fn period_page(
     state: AppState,
     language: Language,
+    if_none_match: IfNoneMatch,
     key: SelectionKey,
     kind: PeriodKind,
     slug: String,
@@ -1063,11 +1092,15 @@ async fn period_page(
     let Some(selection) = key.resolve(&state.db).await? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
-    let tr = language.translation();
     let now = state.clock.now();
     let now_unix = now.as_second();
     let (from, to) = period.bounds(&state.tz)?;
     let (from_unix, to_unix) = (from.as_second(), to.as_second());
+    let caching = Caching::period(state.revision, language, to_unix, now_unix)?;
+    if caching.matches(&if_none_match) {
+        return Ok(caching.not_modified(language));
+    }
+    let tr = language.translation();
     let subjects = selection.subjects(tr);
     let groups = selection::groups(&subjects);
     let series = state
@@ -1149,7 +1182,7 @@ async fn period_page(
             (selection::lines_section(tr, &selection, page, &lines))
         }
     };
-    Ok(shell(language, &page_title(tr, &heading), &body))
+    Ok(shell(language, caching, &page_title(tr, &heading), &body))
 }
 
 fn chart_figure(
@@ -1253,6 +1286,7 @@ async fn chart(
     let rendered = render_chart(metric, &shown, totals.window, &labels)?;
     Ok((
         language_headers(language),
+        Caching::live()?,
         [(header::CONTENT_TYPE, SVG_CONTENT_TYPE)],
         rendered.svg,
     )
@@ -1360,6 +1394,10 @@ mod tests {
     const HTML_CONTENT_TYPE: &str = "text/html; charset=utf-8";
 
     const POLISH_BROWSER: &str = "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7";
+    const TEST_COMMIT: &str = "0123abcd";
+    const SETTLED_CACHE_CONTROL: &str = "max-age=86400";
+    const LIVE_CACHE_CONTROL: &str = "max-age=60";
+    const OTHER_ETAG: &str = "\"other\"";
 
     struct Fetched {
         status: StatusCode,
@@ -1405,9 +1443,20 @@ mod tests {
         .await
     }
 
+    fn app_at(db: &Db, now_unix: i64, revision: Revision) -> Router {
+        let clock = Clock::Fixed(Timestamp::from_second(now_unix).unwrap());
+        app(AppState {
+            revision,
+            ..AppState::new(db.clone(), clock)
+        })
+    }
+
     async fn send(db: &Db, request: axum::http::request::Builder) -> Fetched {
-        let clock = Clock::Fixed(Timestamp::from_second(NOW).unwrap());
-        let response = router(db.clone(), clock)
+        send_to(app_at(db, NOW, Revision::Commit(TEST_COMMIT)), request).await
+    }
+
+    async fn send_to(app: Router, request: axum::http::request::Builder) -> Fetched {
+        let response = app
             .oneshot(request.body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -2610,5 +2659,125 @@ mod tests {
             get(&db, "/charts/average-speed.svg").await.status,
             StatusCode::OK
         );
+    }
+
+    async fn get_if_none_match(db: &Db, uri: &str, if_none_match: &str) -> Fetched {
+        send(
+            db,
+            Request::get(uri).header(header::IF_NONE_MATCH, if_none_match),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn ended_periods_are_not_sent_again_until_the_next_deploy() {
+        let db = db_with_a_bus().await;
+        let yesterday = containing_the_drive(PeriodKind::Day).previous().unwrap();
+        for path in [
+            yesterday.path(),
+            Selection::All.period_quality_path(yesterday),
+        ] {
+            let fetched = get(&db, &path).await;
+            assert_eq!(fetched.status, StatusCode::OK);
+            assert_eq!(
+                header_value(&fetched, header::CACHE_CONTROL),
+                Some(SETTLED_CACHE_CONTROL)
+            );
+            let etag = header_value(&fetched, header::ETAG).unwrap().to_owned();
+            assert!(etag.contains(TEST_COMMIT));
+            for if_none_match in [
+                etag.clone(),
+                format!("W/{etag}"),
+                format!("{OTHER_ETAG}, {etag}"),
+                "*".to_owned(),
+            ] {
+                let not_modified = get_if_none_match(&db, &path, &if_none_match).await;
+                assert_eq!(not_modified.status, StatusCode::NOT_MODIFIED);
+                assert!(not_modified.body.is_empty());
+                assert_eq!(header_value(&not_modified, header::ETAG), Some(&*etag));
+                assert_eq!(
+                    header_value(&not_modified, header::CACHE_CONTROL),
+                    Some(SETTLED_CACHE_CONTROL)
+                );
+                assert_eq!(
+                    header_value(&not_modified, header::VARY),
+                    Some(header::ACCEPT_LANGUAGE.as_str())
+                );
+            }
+            let changed = get_if_none_match(&db, &path, OTHER_ETAG).await;
+            assert_eq!(changed.status, StatusCode::OK);
+            assert!(!changed.body.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn each_language_has_its_own_etag() {
+        let db = db_with_a_bus().await;
+        let path = containing_the_drive(PeriodKind::Day)
+            .previous()
+            .unwrap()
+            .path();
+        let english = get(&db, &path).await;
+        let polish = get_in(&db, &path, POLISH_BROWSER).await;
+        let english_etag = header_value(&english, header::ETAG).unwrap();
+        assert_ne!(Some(english_etag), header_value(&polish, header::ETAG));
+        let switched = send(
+            &db,
+            Request::get(&path)
+                .header(header::ACCEPT_LANGUAGE, POLISH_BROWSER)
+                .header(header::IF_NONE_MATCH, english_etag),
+        )
+        .await;
+        assert_eq!(switched.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn live_pages_are_kept_for_a_minute_only() {
+        let db = db_with_a_bus().await;
+        let today = Period::containing(PeriodKind::Day, local_date(NOW)).unwrap();
+        for path in [
+            OVERVIEW_PATH.to_owned(),
+            format!("{OVERVIEW_PATH}?range=week"),
+            OVERVIEW_QUALITY_PATH.to_owned(),
+            "/charts/average-speed.svg".to_owned(),
+            "/bus".to_owned(),
+            today.path(),
+            Selection::All.period_quality_path(today),
+        ] {
+            let fetched = get_if_none_match(&db, &path, "*").await;
+            assert_eq!(fetched.status, StatusCode::OK, "{path}");
+            assert_eq!(
+                header_value(&fetched, header::CACHE_CONTROL),
+                Some(LIVE_CACHE_CONTROL),
+                "{path}"
+            );
+            assert_eq!(header_value(&fetched, header::ETAG), None, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn periods_are_kept_only_once_their_data_is_final() {
+        let db = db_with_a_bus().await;
+        let day = containing_the_drive(PeriodKind::Day);
+        let (_, to) = day.bounds(&TimeZone::system()).unwrap();
+        let final_unix = to.as_second() + db::duration_secs(stats::final_delay());
+        let at =
+            |now_unix, revision| send_to(app_at(&db, now_unix, revision), Request::get(day.path()));
+        let commit = Revision::Commit(TEST_COMMIT);
+        for (fetched, cache_control, has_etag) in [
+            (at(final_unix - 1, commit).await, LIVE_CACHE_CONTROL, false),
+            (at(final_unix, commit).await, SETTLED_CACHE_CONTROL, true),
+            (
+                at(final_unix, Revision::Unknown).await,
+                LIVE_CACHE_CONTROL,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                header_value(&fetched, header::CACHE_CONTROL),
+                Some(cache_control)
+            );
+            assert_eq!(header_value(&fetched, header::ETAG).is_some(), has_etag);
+        }
     }
 }

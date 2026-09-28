@@ -360,8 +360,7 @@ impl StatsCache {
         let resolution_secs = db::duration_secs(self.resolution);
         let from_unix = align_down(from_unix, resolution_secs);
         let to_unix = align_up(to_unix, resolution_secs);
-        let final_before_unix =
-            now_unix - resolution_secs - db::duration_secs(max_step_span() + SAVE_DELAY);
+        let final_before_unix = now_unix - resolution_secs - db::duration_secs(final_delay());
         let _computing = self.computing.lock().await;
         let mut unfinished = BTreeMap::new();
         if let Some((first_unix, end_unix)) = self.missing_range(from_unix, to_unix) {
@@ -427,6 +426,11 @@ impl StatsCache {
 
 fn max_step_span() -> Duration {
     db::MAX_ROW_SPAN + MAX_STEP_GAP
+}
+
+#[must_use]
+pub fn final_delay() -> Duration {
+    max_step_span() + SAVE_DELAY
 }
 
 fn compute(points: &[TypedPathPoint], from_unix: i64, to_unix: i64) -> Vec<Bucket> {
@@ -915,7 +919,7 @@ mod tests {
     }
 
     fn final_delay_secs() -> i64 {
-        db::duration_secs(max_step_span() + SAVE_DELAY)
+        db::duration_secs(final_delay())
     }
 
     fn travel_per_minute(buckets: &[Bucket], kind: Kind) -> Vec<i64> {

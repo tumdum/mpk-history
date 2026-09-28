@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use maud::{Markup, html};
 
+use super::caching::{Caching, IfNoneMatch};
 use super::i18n::{Language, Neighbour, Text, Translation, capitalized};
 use super::period::{Period, PeriodKind};
 use super::selection::{self, Page, Selection, SelectionKey, Subject};
@@ -529,12 +530,18 @@ pub(super) async fn overview(
             (selection::lines_section(tr, &selection, page, &lines))
         }
     };
-    Ok(shell(language, &page_title(tr, &heading), &body))
+    Ok(shell(
+        language,
+        Caching::live()?,
+        &page_title(tr, &heading),
+        &body,
+    ))
 }
 
 pub(super) async fn period_page(
     state: AppState,
     language: Language,
+    if_none_match: IfNoneMatch,
     key: SelectionKey,
     kind: PeriodKind,
     slug: String,
@@ -545,10 +552,14 @@ pub(super) async fn period_page(
     let Some(selection) = key.resolve(&state.db).await? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
-    let tr = language.translation();
     let now = state.clock.now();
     let (from, to) = period.bounds(&state.tz)?;
     let window = (from.as_second(), to.as_second());
+    let caching = Caching::period(state.revision, language, window.1, now.as_second())?;
+    if caching.matches(&if_none_match) {
+        return Ok(caching.not_modified(language));
+    }
+    let tr = language.translation();
     let quality = Quality::load(&state.db, &selection, window).await?;
     let subjects = selection.subjects(tr);
     let shares = quality.position_shares(&subjects);
@@ -625,7 +636,7 @@ pub(super) async fn period_page(
             (selection::lines_section(tr, &selection, page, &lines))
         }
     };
-    Ok(shell(language, &page_title(tr, &heading), &body))
+    Ok(shell(language, caching, &page_title(tr, &heading), &body))
 }
 
 #[cfg(test)]

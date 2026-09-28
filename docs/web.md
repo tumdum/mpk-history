@@ -226,6 +226,25 @@ collector waits at most for one chunk. A year of data takes a few minutes; until
 done, calendar pages and the last week and month of a line wait for it. Nothing is
 stored in the database, so this happens after every restart.
 
+## HTTP caching
+
+Nothing is stored on the server, but the responses tell browsers how long they can
+keep them:
+
+| Response | `Cache-Control` | `ETag` |
+|---|---|---|
+| Calendar and data quality pages of a period whose data is final | `max-age=86400` | `"<git commit>-<language>"` |
+| Everything else: overview, `?range=…`, `/quality`, chart images, periods not ended yet | `max-age=60` | none |
+
+A period's data is final 12 minutes after it ends, like the finished buckets above.
+When a request's `If-None-Match` has the page's `ETag` (or `*`), the server answers
+`304` before computing anything, so it doesn't wait for the history cache either.
+
+The `ETag` changes with each deploy, so new HTML is sent after it. A build from a dirty
+working copy (usual with jj) or without git information has no commit to go by, so it
+sends no `ETag` and every page gets `max-age=60`. Data imported for an old period later
+shows only after the browser's copy expires.
+
 ## Tests
 
 - `src/stats.rs`, `src/charts.rs`, `src/web.rs`, `src/web/selection.rs`: unit tests

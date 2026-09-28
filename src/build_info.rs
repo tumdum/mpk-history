@@ -28,3 +28,8 @@ pub fn user_agent() -> String {
         commit()
     )
 }
+
+#[must_use]
+pub fn clean_commit() -> Option<&'static str> {
+    built_info::GIT_COMMIT_HASH.filter(|_| dirty() == Some(false))
+}
