@@ -38,6 +38,8 @@ navigation links and the tables.
 
 Each page has a `<meta name="description">` for search engines: its heading followed by
 one translated sentence, one for statistics pages and one for data quality pages.
+Every page also loads the Google Analytics tag (`gtag.js`, id `G-ZCQG7QP403`) in its
+`<head>`.
 
 Chart colors are chosen so that every pair of lines in a chart stays apart for the
 common kinds of color blindness, since any two lines can cross. The vehicle charts use

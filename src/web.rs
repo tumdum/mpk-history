@@ -41,6 +41,13 @@ const MISSING_VALUE: &str = "–";
 const UPDATED_FORMAT: &str = "%Y-%m-%d %H:%M";
 const INTERNAL_ERROR: &str = "internal error";
 const CHART_SCRIPT: &str = include_str!("chart_hover.js");
+const GTAG_ID: &str = "G-ZCQG7QP403";
+const GTAG_SRC: &str = "https://www.googletagmanager.com/gtag/js";
+const GTAG_SCRIPT: &str = "
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+";
 const SCRIPT_END_TAG_START: &str = "</";
 const ESCAPED_SCRIPT_END_TAG_START: &str = "<\\/";
 const HISTORY_RESOLUTION: Duration = Duration::from_mins(15);
@@ -1073,6 +1080,8 @@ fn shell(language: Language, caching: Caching, head: &Head, body: &Markup) -> Re
         html lang=(language.tag()) {
             head {
                 meta charset="utf-8";
+                script async src=(format!("{GTAG_SRC}?id={GTAG_ID}")) {}
+                script { (PreEscaped(format!("{GTAG_SCRIPT}  gtag('config', '{GTAG_ID}');\n"))) }
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (head.title) }
                 meta name="description" content=(head.description);
