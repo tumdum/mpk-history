@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use axum::Router;
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use jiff::civil::Date;
@@ -16,22 +16,22 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-use crate::charts::{self, LineChart, Point, RGBColor, Rendered, Series, TickStep};
+use crate::charts::{self, Labels, LineChart, Point, RGBColor, Rendered, Series, TickStep};
 use crate::db::{self, Db};
 use crate::mpk::VehicleType;
 use crate::stats::{self, Detail, Group, Kind, Retention, StatsCache, TimedTotals, Totals};
 
+mod i18n;
 mod period;
 mod quality;
 mod selection;
 
+use i18n::{ChartTime, Language, Neighbour, Relative, Text, Translation, capitalized};
 use period::{Period, PeriodKind};
 use quality::{OVERVIEW_QUALITY_PATH, QUALITY_SEGMENT};
 use selection::{Page, Selection, SelectionKey, Subject};
 
-const TITLE: &str = "MPK Wrocław statistics";
 const OVERVIEW_PATH: &str = "/";
-const OVERVIEW_LABEL: &str = "Overview";
 const CHARTS_PATH: &str = "/charts/{file}";
 const SVG_EXTENSION: &str = ".svg";
 const SVG_CONTENT_TYPE: &str = "image/svg+xml";
@@ -199,8 +199,8 @@ impl ChartStep {
 struct ChartSpec {
     step: ChartStep,
     tick_step: TickStep,
-    tick_format: &'static str,
-    hover_format: &'static str,
+    tick: ChartTime,
+    hover: ChartTime,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -231,26 +231,26 @@ impl Range {
             Range::Hour => ChartSpec {
                 step: ChartStep::Minutes(1),
                 tick_step: TickStep::Minutes(10),
-                tick_format: "%H:%M",
-                hover_format: "%H:%M",
+                tick: ChartTime::Time,
+                hover: ChartTime::Time,
             },
             Range::Day => ChartSpec {
                 step: ChartStep::Minutes(15),
                 tick_step: TickStep::Hours(3),
-                tick_format: "%H:%M",
-                hover_format: "%a %H:%M",
+                tick: ChartTime::Time,
+                hover: ChartTime::WeekdayTime,
             },
             Range::Week => ChartSpec {
                 step: ChartStep::Hours(1),
                 tick_step: TickStep::Days(1),
-                tick_format: "%a %d.%m",
-                hover_format: "%a %d.%m %H:%M",
+                tick: ChartTime::WeekdayDayMonth,
+                hover: ChartTime::WeekdayDayMonthTime,
             },
             Range::Month => ChartSpec {
                 step: ChartStep::Hours(6),
                 tick_step: TickStep::Days(5),
-                tick_format: "%d.%m",
-                hover_format: "%a %d.%m %H:%M",
+                tick: ChartTime::DayMonth,
+                hover: ChartTime::WeekdayDayMonthTime,
             },
         }
     }
@@ -261,15 +261,6 @@ impl Range {
             Range::Day => "day",
             Range::Week => "week",
             Range::Month => "month",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Range::Hour => "Last hour",
-            Range::Day => "Last day",
-            Range::Week => "Last week",
-            Range::Month => "Last month",
         }
     }
 
@@ -305,15 +296,6 @@ impl Metric {
         }
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            Metric::AverageSpeed => "Average speed (km/h)",
-            Metric::AverageVehicles => "Average active vehicles",
-            Metric::PeakVehicles => "Peak active vehicles",
-            Metric::Distance => "Distance driven (km)",
-        }
-    }
-
     fn decimals(self) -> usize {
         match self {
             Metric::AverageSpeed | Metric::AverageVehicles => 1,
@@ -331,14 +313,14 @@ impl Metric {
         }
     }
 
-    fn format(self, totals: &Totals) -> String {
-        self.format_value(self.value(totals))
+    fn format(self, totals: &Totals, tr: &dyn Translation) -> String {
+        self.format_value(self.value(totals), tr)
     }
 
-    fn format_value(self, value: Option<f64>) -> String {
+    fn format_value(self, value: Option<f64>, tr: &dyn Translation) -> String {
         value.map_or_else(
             || MISSING_VALUE.to_owned(),
-            |value| format!("{value:.*}", self.decimals()),
+            |value| tr.number(value, self.decimals()),
         )
     }
 
@@ -354,15 +336,6 @@ fn kind_slug(kind: Kind) -> &'static str {
     match kind {
         Kind::All => "all",
         Kind::Vehicle(vehicle_type) => vehicle_type.as_str(),
-    }
-}
-
-fn kind_label(kind: Kind) -> &'static str {
-    match kind {
-        Kind::All => "All vehicles",
-        Kind::Vehicle(VehicleType::Bus) => "Buses",
-        Kind::Vehicle(VehicleType::Tram) => "Trams",
-        Kind::Vehicle(VehicleType::Train) => "Trains",
     }
 }
 
@@ -649,16 +622,20 @@ fn app(state: AppState) -> Router {
         .route(
             OVERVIEW_PATH,
             get(
-                |State(state): State<AppState>, Query(query): Query<RangeQuery>| {
-                    overview(state, SelectionKey::All, query.range)
+                |State(state): State<AppState>,
+                 language: Language,
+                 Query(query): Query<RangeQuery>| {
+                    overview(state, language, SelectionKey::All, query.range)
                 },
             ),
         )
         .route(
             OVERVIEW_QUALITY_PATH,
             get(
-                |State(state): State<AppState>, Query(query): Query<RangeQuery>| {
-                    quality::overview(state, SelectionKey::All, query.range)
+                |State(state): State<AppState>,
+                 language: Language,
+                 Query(query): Query<RangeQuery>| {
+                    quality::overview(state, language, SelectionKey::All, query.range)
                 },
             ),
         )
@@ -666,9 +643,10 @@ fn app(state: AppState) -> Router {
             CHARTS_PATH,
             get(
                 |State(state): State<AppState>,
+                 language: Language,
                  Path(file): Path<String>,
                  Query(query): Query<RangeQuery>| {
-                    chart(state, SelectionKey::All, file, query.range)
+                    chart(state, language, SelectionKey::All, file, query.range)
                 },
             ),
         );
@@ -677,16 +655,20 @@ fn app(state: AppState) -> Router {
             .route(
                 &period_route(kind),
                 get(
-                    move |State(state): State<AppState>, Path(slug): Path<String>| {
-                        period_page(state, SelectionKey::All, kind, slug)
+                    move |State(state): State<AppState>,
+                          language: Language,
+                          Path(slug): Path<String>| {
+                        period_page(state, language, SelectionKey::All, kind, slug)
                     },
                 ),
             )
             .route(
                 &quality_route(&period_route(kind)),
                 get(
-                    move |State(state): State<AppState>, Path(slug): Path<String>| {
-                        quality::period_page(state, SelectionKey::All, kind, slug)
+                    move |State(state): State<AppState>,
+                          language: Language,
+                          Path(slug): Path<String>| {
+                        quality::period_page(state, language, SelectionKey::All, kind, slug)
                     },
                 ),
             );
@@ -706,8 +688,15 @@ fn vehicle_type_routes(
         .route(
             &type_path,
             get(
-                move |State(state): State<AppState>, Query(query): Query<RangeQuery>| {
-                    overview(state, SelectionKey::Type(vehicle_type), query.range)
+                move |State(state): State<AppState>,
+                      language: Language,
+                      Query(query): Query<RangeQuery>| {
+                    overview(
+                        state,
+                        language,
+                        SelectionKey::Type(vehicle_type),
+                        query.range,
+                    )
                 },
             ),
         )
@@ -715,9 +704,15 @@ fn vehicle_type_routes(
             &line_path,
             get(
                 move |State(state): State<AppState>,
+                      language: Language,
                       Path(line): Path<String>,
                       Query(query): Query<RangeQuery>| {
-                    overview(state, SelectionKey::Line(vehicle_type, line), query.range)
+                    overview(
+                        state,
+                        language,
+                        SelectionKey::Line(vehicle_type, line),
+                        query.range,
+                    )
                 },
             ),
         )
@@ -725,9 +720,16 @@ fn vehicle_type_routes(
             &format!("{type_path}{CHARTS_PATH}"),
             get(
                 move |State(state): State<AppState>,
+                      language: Language,
                       Path(file): Path<String>,
                       Query(query): Query<RangeQuery>| {
-                    chart(state, SelectionKey::Type(vehicle_type), file, query.range)
+                    chart(
+                        state,
+                        language,
+                        SelectionKey::Type(vehicle_type),
+                        file,
+                        query.range,
+                    )
                 },
             ),
         )
@@ -735,10 +737,12 @@ fn vehicle_type_routes(
             &format!("{line_path}{CHARTS_PATH}"),
             get(
                 move |State(state): State<AppState>,
+                      language: Language,
                       Path((line, file)): Path<(String, String)>,
                       Query(query): Query<RangeQuery>| {
                     chart(
                         state,
+                        language,
                         SelectionKey::Line(vehicle_type, line),
                         file,
                         query.range,
@@ -749,8 +753,15 @@ fn vehicle_type_routes(
         .route(
             &quality_route(&type_path),
             get(
-                move |State(state): State<AppState>, Query(query): Query<RangeQuery>| {
-                    quality::overview(state, SelectionKey::Type(vehicle_type), query.range)
+                move |State(state): State<AppState>,
+                      language: Language,
+                      Query(query): Query<RangeQuery>| {
+                    quality::overview(
+                        state,
+                        language,
+                        SelectionKey::Type(vehicle_type),
+                        query.range,
+                    )
                 },
             ),
         )
@@ -758,9 +769,15 @@ fn vehicle_type_routes(
             &quality_route(&line_path),
             get(
                 move |State(state): State<AppState>,
+                      language: Language,
                       Path(line): Path<String>,
                       Query(query): Query<RangeQuery>| {
-                    quality::overview(state, SelectionKey::Line(vehicle_type, line), query.range)
+                    quality::overview(
+                        state,
+                        language,
+                        SelectionKey::Line(vehicle_type, line),
+                        query.range,
+                    )
                 },
             ),
         );
@@ -777,8 +794,16 @@ fn vehicle_type_period_routes(
             .route(
                 &format!("{type_path}{}", period_route(kind)),
                 get(
-                    move |State(state): State<AppState>, Path(slug): Path<String>| {
-                        period_page(state, SelectionKey::Type(vehicle_type), kind, slug)
+                    move |State(state): State<AppState>,
+                          language: Language,
+                          Path(slug): Path<String>| {
+                        period_page(
+                            state,
+                            language,
+                            SelectionKey::Type(vehicle_type),
+                            kind,
+                            slug,
+                        )
                     },
                 ),
             )
@@ -786,16 +811,31 @@ fn vehicle_type_period_routes(
                 &format!("{line_path}{}", period_route(kind)),
                 get(
                     move |State(state): State<AppState>,
+                          language: Language,
                           Path((line, slug)): Path<(String, String)>| {
-                        period_page(state, SelectionKey::Line(vehicle_type, line), kind, slug)
+                        period_page(
+                            state,
+                            language,
+                            SelectionKey::Line(vehicle_type, line),
+                            kind,
+                            slug,
+                        )
                     },
                 ),
             )
             .route(
                 &quality_route(&format!("{type_path}{}", period_route(kind))),
                 get(
-                    move |State(state): State<AppState>, Path(slug): Path<String>| {
-                        quality::period_page(state, SelectionKey::Type(vehicle_type), kind, slug)
+                    move |State(state): State<AppState>,
+                          language: Language,
+                          Path(slug): Path<String>| {
+                        quality::period_page(
+                            state,
+                            language,
+                            SelectionKey::Type(vehicle_type),
+                            kind,
+                            slug,
+                        )
                     },
                 ),
             )
@@ -803,9 +843,11 @@ fn vehicle_type_period_routes(
                 &quality_route(&format!("{line_path}{}", period_route(kind))),
                 get(
                     move |State(state): State<AppState>,
+                          language: Language,
                           Path((line, slug)): Path<(String, String)>| {
                         quality::period_page(
                             state,
+                            language,
                             SelectionKey::Line(vehicle_type, line),
                             kind,
                             slug,
@@ -854,15 +896,17 @@ struct RangeQuery {
 
 async fn overview(
     state: AppState,
+    language: Language,
     key: SelectionKey,
     selected: Range,
 ) -> Result<Response, AppError> {
     let Some(selection) = key.resolve(&state.db).await? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
+    let tr = language.translation();
     let now = state.clock.now();
     let now_unix = now.as_second();
-    let subjects = selection.subjects();
+    let subjects = selection.subjects(tr);
     let groups = selection::groups(&subjects);
     let ranges = state.recent_ranges(&groups, now_unix).await?;
     let mut rows = vec![Vec::with_capacity(ranges.len()); subjects.len()];
@@ -876,14 +920,14 @@ async fn overview(
     });
     let chart = state.recent_range(&groups, selected, now_unix).await?;
     let shown = selection::shown(&subjects, &chart.series, |series| has_vehicles(series));
-    let caption = selected.label().to_lowercase();
+    let labels = ChartLabels::new(tr, selected.chart(), &state.tz);
     let mut figures = Vec::with_capacity(Metric::CHARTED.len());
     for metric in Metric::CHARTED {
-        let rendered = render_chart(metric, &shown, chart.window, selected.chart(), &state.tz)?;
+        let rendered = render_chart(metric, &shown, chart.window, &labels)?;
         figures.push(chart_figure(
             metric.slug(),
-            metric.label(),
-            &caption,
+            tr.metric(metric),
+            tr.range_caption(selected),
             selected.slug(),
             &rendered,
         )?);
@@ -896,22 +940,22 @@ async fn overview(
     let page = Page::Overview(selected);
     let history = history_links(state.today())?;
     let heading = match selection {
-        Selection::All => TITLE.to_owned(),
-        Selection::Type(_) | Selection::Line(_) => selection.label(),
+        Selection::All => tr.text(Text::Title).to_owned(),
+        Selection::Type(_) | Selection::Line(_) => selection.label(tr),
     };
     let body = html! {
         header {
             h1 { (heading) }
-            p #updated { "As of " (updated(now, &state.tz)) }
+            p #updated { (tr.text(Text::AsOf)) (updated(now, &state.tz)) }
         }
         main {
             section #charts {
-                h2 { "Charts" }
-                nav aria-label="Chart range" {
+                h2 { (tr.text(Text::Charts)) }
+                nav aria-label=(tr.text(Text::ChartRange)) {
                     @for range in Range::ALL {
                         a href=(selection.range_path(range))
                             aria-current=[(range == selected).then_some("page")] {
-                            (range.label())
+                            (tr.range(range))
                         }
                     }
                 }
@@ -919,45 +963,51 @@ async fn overview(
                     (figure)
                 }
             }
-            (selection::vehicles_nav(&selection, page, &lines))
-            nav #history aria-label="History" {
-                @for (label, period) in &history {
-                    a href=(selection.period_path(*period)) { (label) }
+            (selection::vehicles_nav(tr, &selection, page, &lines))
+            nav #history aria-label=(tr.text(Text::History)) {
+                @for (relative, period) in &history {
+                    a href=(selection.period_path(*period)) {
+                        (tr.relative_period(period.kind(), *relative))
+                    }
                 }
             }
-            nav #pages aria-label="Pages" {
-                a #quality-link href=(selection.quality_path()) { "Data quality" }
+            nav #pages aria-label=(tr.text(Text::Pages)) {
+                a #quality-link href=(selection.quality_path()) { (tr.text(Text::DataQuality)) }
             }
             section #summary {
-                h2 { "Summary" }
+                h2 { (tr.text(Text::Summary)) }
                 @for (subject, rows) in &tables {
-                    (range_table(subject, rows))
+                    (range_table(tr, subject, rows))
                 }
             }
-            (selection::lines_section(&selection, page, &lines))
+            (selection::lines_section(tr, &selection, page, &lines))
         }
     };
     let title = match selection {
-        Selection::All => TITLE.to_owned(),
-        Selection::Type(_) | Selection::Line(_) => format!("{heading} – {TITLE}"),
+        Selection::All => heading,
+        Selection::Type(_) | Selection::Line(_) => page_title(tr, &heading),
     };
-    Ok(shell(&title, &body).into_response())
+    Ok(shell(language, &title, &body))
 }
 
-fn history_links(today: Date) -> Result<Vec<(&'static str, Period)>> {
+fn history_links(today: Date) -> Result<Vec<(Relative, Period)>> {
     let day = Period::containing(PeriodKind::Day, today)?;
     let week = Period::containing(PeriodKind::Week, today)?;
     let month = Period::containing(PeriodKind::Month, today)?;
     let year = Period::containing(PeriodKind::Year, today)?;
     Ok(vec![
-        ("Today", day),
-        ("Yesterday", day.previous()?),
-        ("This week", week),
-        ("Previous week", week.previous()?),
-        ("This month", month),
-        ("Previous month", month.previous()?),
-        ("This year", year),
+        (Relative::Current, day),
+        (Relative::Previous, day.previous()?),
+        (Relative::Current, week),
+        (Relative::Previous, week.previous()?),
+        (Relative::Current, month),
+        (Relative::Previous, month.previous()?),
+        (Relative::Current, year),
     ])
+}
+
+fn page_title(tr: &dyn Translation, heading: &str) -> String {
+    format!("{heading} – {}", tr.text(Text::Title))
 }
 
 fn updated(now: Timestamp, tz: &TimeZone) -> Markup {
@@ -968,10 +1018,10 @@ fn updated(now: Timestamp, tz: &TimeZone) -> Markup {
     html! { time datetime=(now.to_string()) { (local) } }
 }
 
-fn shell(title: &str, body: &Markup) -> Markup {
-    html! {
+fn shell(language: Language, title: &str, body: &Markup) -> Response {
+    let markup = html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang=(language.tag()) {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
@@ -983,11 +1033,26 @@ fn shell(title: &str, body: &Markup) -> Markup {
                 script { (PreEscaped(CHART_SCRIPT)) }
             }
         }
-    }
+    };
+    (language_headers(language), markup).into_response()
+}
+
+fn language_headers(language: Language) -> [(header::HeaderName, HeaderValue); 2] {
+    [
+        (
+            header::CONTENT_LANGUAGE,
+            HeaderValue::from_static(language.tag()),
+        ),
+        (
+            header::VARY,
+            HeaderValue::from_static(header::ACCEPT_LANGUAGE.as_str()),
+        ),
+    ]
 }
 
 async fn period_page(
     state: AppState,
+    language: Language,
     key: SelectionKey,
     kind: PeriodKind,
     slug: String,
@@ -998,31 +1063,27 @@ async fn period_page(
     let Some(selection) = key.resolve(&state.db).await? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
+    let tr = language.translation();
     let now = state.clock.now();
     let now_unix = now.as_second();
     let (from, to) = period.bounds(&state.tz)?;
     let (from_unix, to_unix) = (from.as_second(), to.as_second());
-    let subjects = selection.subjects();
+    let subjects = selection.subjects(tr);
     let groups = selection::groups(&subjects);
     let series = state
         .period_totals(from_unix, to_unix, now_unix, &groups)
         .await?;
     let shown = selection::shown(&subjects, &series, |series| has_vehicles(series));
-    let caption = period.title();
+    let title = period.title(tr);
     let path = selection.period_path(period);
+    let labels = ChartLabels::new(tr, period.chart(), &state.tz);
     let mut figures = Vec::with_capacity(Metric::CHARTED.len());
     for metric in Metric::CHARTED {
-        let rendered = render_chart(
-            metric,
-            &shown,
-            (from_unix, to_unix),
-            period.chart(),
-            &state.tz,
-        )?;
+        let rendered = render_chart(metric, &shown, (from_unix, to_unix), &labels)?;
         figures.push(chart_figure(
             metric.slug(),
-            metric.label(),
-            &caption,
+            tr.metric(metric),
+            &title,
             &path,
             &rendered,
         )?);
@@ -1035,57 +1096,60 @@ async fn period_page(
     let in_progress = (from_unix..to_unix).contains(&now_unix);
     let parents = period.parents()?;
     let parts = period.parts()?;
-    let noun = kind.slug();
-    let heading = selection.heading(&period.title());
+    let heading = selection.heading(tr, &title);
     let body = html! {
         header {
             p .breadcrumbs {
-                a href=(selection.overview_path()) { (OVERVIEW_LABEL) }
+                a href=(selection.overview_path()) { (tr.text(Text::Overview)) }
                 @for parent in &parents {
-                    " · " a href=(selection.period_path(*parent)) { (parent.title()) }
+                    " · " a href=(selection.period_path(*parent)) { (capitalized(&parent.title(tr))) }
                 }
             }
             h1 { (heading) }
-            @if let Some(subtitle) = period.subtitle()? {
+            @if let Some(subtitle) = period.subtitle(tr)? {
                 p .subtitle { (subtitle) }
             }
             @if in_progress {
-                p #updated { "So far, as of " (updated(now, &state.tz)) }
+                p #updated { (tr.text(Text::SoFarAsOf)) (updated(now, &state.tz)) }
             }
         }
         main {
             section #charts {
-                h2 { "Charts" }
+                h2 { (tr.text(Text::Charts)) }
                 @for figure in &figures {
                     (figure)
                 }
             }
-            (selection::vehicles_nav(&selection, page, &lines))
-            nav .period-nav aria-label="Neighbouring periods" {
-                a #previous rel="prev" href=(selection.period_path(previous)) { "← Previous " (noun) }
-                @if next_started {
-                    a #next rel="next" href=(selection.period_path(next)) { "Next " (noun) " →" }
+            (selection::vehicles_nav(tr, &selection, page, &lines))
+            nav .period-nav aria-label=(tr.text(Text::NeighbouringPeriods)) {
+                a #previous rel="prev" href=(selection.period_path(previous)) {
+                    (tr.neighbour(kind, Neighbour::Previous))
                 }
-                a #quality-link href=(selection.period_quality_path(period)) { "Data quality" }
+                @if next_started {
+                    a #next rel="next" href=(selection.period_path(next)) {
+                        (tr.neighbour(kind, Neighbour::Next))
+                    }
+                }
+                a #quality-link href=(selection.period_quality_path(period)) { (tr.text(Text::DataQuality)) }
             }
             section #summary {
-                h2 { "Summary" }
-                (period_table(&shown))
+                h2 { (tr.text(Text::Summary)) }
+                (period_table(tr, &shown))
             }
             @if let Some(part) = parts.first() {
                 section #parts {
-                    h2 { (part.kind().plural_label()) }
-                    nav aria-label=(part.kind().plural_label()) {
+                    h2 { (tr.parts(part.kind())) }
+                    nav aria-label=(tr.parts(part.kind())) {
                         @for part in &parts {
-                            a href=(selection.period_path(*part)) { (part.short_label()) }
+                            a href=(selection.period_path(*part)) { (capitalized(&part.short_label(tr))) }
                         }
                     }
                 }
             }
-            (selection::lines_section(&selection, page, &lines))
+            (selection::lines_section(tr, &selection, page, &lines))
         }
     };
-    Ok(shell(&format!("{heading} – {TITLE}"), &body).into_response())
+    Ok(shell(language, &page_title(tr, &heading), &body))
 }
 
 fn chart_figure(
@@ -1107,25 +1171,25 @@ fn chart_figure(
     })
 }
 
-fn range_table(subject: &Subject, rows: &[(Range, Totals)]) -> Markup {
+fn range_table(tr: &dyn Translation, subject: &Subject, rows: &[(Range, Totals)]) -> Markup {
     html! {
         div .table-wrap {
             table .stats #(format!("stats-{}", subject.slug)) {
                 caption { (subject.label) }
                 thead {
                     tr {
-                        th scope="col" { "Metric" }
+                        th scope="col" { (tr.text(Text::Metric)) }
                         @for (range, _) in rows {
-                            th scope="col" { (range.label()) }
+                            th scope="col" { (tr.range(*range)) }
                         }
                     }
                 }
                 tbody {
                     @for metric in Metric::ALL {
                         tr data-metric=(metric.slug()) {
-                            th scope="row" { (metric.label()) }
+                            th scope="row" { (tr.metric(metric)) }
                             @for (range, totals) in rows {
-                                td data-range=(range.slug()) { (metric.format(totals)) }
+                                td data-range=(range.slug()) { (metric.format(totals, tr)) }
                             }
                         }
                     }
@@ -1135,7 +1199,7 @@ fn range_table(subject: &Subject, rows: &[(Range, Totals)]) -> Markup {
     }
 }
 
-fn period_table(shown: &[(&Subject, &Vec<TimedTotals>)]) -> Markup {
+fn period_table(tr: &dyn Translation, shown: &[(&Subject, &Vec<TimedTotals>)]) -> Markup {
     let totals: Vec<(&Subject, Totals)> = shown
         .iter()
         .map(|(subject, series)| (*subject, stats::sum(series.iter())))
@@ -1145,7 +1209,7 @@ fn period_table(shown: &[(&Subject, &Vec<TimedTotals>)]) -> Markup {
             table .stats #period-stats {
                 thead {
                     tr {
-                        th scope="col" { "Metric" }
+                        th scope="col" { (tr.text(Text::Metric)) }
                         @for (subject, _) in &totals {
                             th scope="col" data-kind=(subject.slug) { (subject.label) }
                         }
@@ -1154,9 +1218,9 @@ fn period_table(shown: &[(&Subject, &Vec<TimedTotals>)]) -> Markup {
                 tbody {
                     @for metric in Metric::ALL {
                         tr data-metric=(metric.slug()) {
-                            th scope="row" { (metric.label()) }
+                            th scope="row" { (tr.metric(metric)) }
                             @for (subject, total) in &totals {
-                                td data-kind=(subject.slug) { (metric.format(total)) }
+                                td data-kind=(subject.slug) { (metric.format(total, tr)) }
                             }
                         }
                     }
@@ -1168,6 +1232,7 @@ fn period_table(shown: &[(&Subject, &Vec<TimedTotals>)]) -> Markup {
 
 async fn chart(
     state: AppState,
+    language: Language,
     key: SelectionKey,
     file: String,
     range: Range,
@@ -1178,35 +1243,82 @@ async fn chart(
     let Some(selection) = key.resolve(&state.db).await? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
-    let subjects = selection.subjects();
+    let tr = language.translation();
+    let subjects = selection.subjects(tr);
     let groups = selection::groups(&subjects);
     let now_unix = state.clock.now().as_second();
     let totals = state.recent_range(&groups, range, now_unix).await?;
     let shown = selection::shown(&subjects, &totals.series, |series| has_vehicles(series));
-    let rendered = render_chart(metric, &shown, totals.window, range.chart(), &state.tz)?;
-    Ok(([(header::CONTENT_TYPE, SVG_CONTENT_TYPE)], rendered.svg).into_response())
+    let labels = ChartLabels::new(tr, range.chart(), &state.tz);
+    let rendered = render_chart(metric, &shown, totals.window, &labels)?;
+    Ok((
+        language_headers(language),
+        [(header::CONTENT_TYPE, SVG_CONTENT_TYPE)],
+        rendered.svg,
+    )
+        .into_response())
+}
+
+struct ChartLabels<'a> {
+    tr: &'a dyn Translation,
+    spec: ChartSpec,
+    tz: &'a TimeZone,
+}
+
+impl<'a> ChartLabels<'a> {
+    fn new(tr: &'a dyn Translation, spec: ChartSpec, tz: &'a TimeZone) -> Self {
+        Self { tr, spec, tz }
+    }
+
+    fn time(&self, unix: i64, format: ChartTime) -> String {
+        Timestamp::from_second(unix).map_or_else(
+            |_| String::new(),
+            |timestamp| {
+                self.tr
+                    .chart_time(&timestamp.to_zoned(self.tz.clone()), format)
+            },
+        )
+    }
+}
+
+impl Labels for ChartLabels<'_> {
+    fn tick(&self, unix: i64) -> String {
+        self.time(unix, self.spec.tick)
+    }
+
+    fn hover(&self, unix: i64) -> String {
+        self.time(unix, self.spec.hover)
+    }
+
+    fn number(&self, value: f64, decimals: usize) -> String {
+        self.tr.number(value, decimals)
+    }
+
+    fn no_data(&self) -> &str {
+        self.tr.text(Text::NoData)
+    }
 }
 
 fn render_chart(
     metric: Metric,
     shown: &[(&Subject, &Vec<TimedTotals>)],
     (from_unix, to_unix): (i64, i64),
-    spec: ChartSpec,
-    tz: &TimeZone,
+    labels: &ChartLabels,
 ) -> Result<Rendered> {
+    let step = labels.spec.step;
     let series = shown
         .iter()
         .map(|(subject, series)| Series {
             name: subject.label.clone(),
             color: subject.color,
-            points: stats::regroup_by(series, |start_unix| spec.step.start_of(start_unix, tz))
+            points: stats::regroup_by(series, |start_unix| step.start_of(start_unix, labels.tz))
                 .iter()
                 .map(|timed| {
                     let value = metric.value(&timed.totals);
                     Point {
                         unix: timed.start_unix.max(from_unix),
                         value,
-                        text: metric.format_value(value),
+                        text: metric.format_value(value, labels.tr),
                     }
                 })
                 .collect(),
@@ -1215,10 +1327,9 @@ fn render_chart(
     charts::render(&LineChart {
         from_unix,
         to_unix,
-        y_label: metric.label(),
-        tick_format: spec.tick_format,
-        hover_format: spec.hover_format,
-        tick_step: spec.tick_step,
+        y_label: labels.tr.metric(metric),
+        labels,
+        tick_step: labels.spec.tick_step,
         series,
     })
 }
@@ -1248,9 +1359,12 @@ mod tests {
     const HUNDRED_METERS_NORTH_E6: i64 = 898;
     const HTML_CONTENT_TYPE: &str = "text/html; charset=utf-8";
 
+    const POLISH_BROWSER: &str = "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7";
+
     struct Fetched {
         status: StatusCode,
         content_type: Option<String>,
+        headers: header::HeaderMap,
         body: String,
     }
 
@@ -1280,22 +1394,46 @@ mod tests {
     }
 
     async fn get(db: &Db, uri: &str) -> Fetched {
+        send(db, Request::get(uri)).await
+    }
+
+    async fn get_in(db: &Db, uri: &str, accept_language: &str) -> Fetched {
+        send(
+            db,
+            Request::get(uri).header(header::ACCEPT_LANGUAGE, accept_language),
+        )
+        .await
+    }
+
+    async fn send(db: &Db, request: axum::http::request::Builder) -> Fetched {
         let clock = Clock::Fixed(Timestamp::from_second(NOW).unwrap());
         let response = router(db.clone(), clock)
-            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .oneshot(request.body(Body::empty()).unwrap())
             .await
             .unwrap();
         let status = response.status();
-        let content_type = response
-            .headers()
+        let headers = response.headers().clone();
+        let content_type = headers
             .get(header::CONTENT_TYPE)
             .map(|value| value.to_str().unwrap().to_owned());
         let body = response.into_body().collect().await.unwrap().to_bytes();
         Fetched {
             status,
             content_type,
+            headers,
             body: String::from_utf8(body.to_vec()).unwrap(),
         }
+    }
+
+    fn header_value(fetched: &Fetched, name: header::HeaderName) -> Option<&str> {
+        fetched
+            .headers
+            .get(name)
+            .map(|value| value.to_str().unwrap())
+    }
+
+    fn en() -> &'static dyn Translation {
+        Language::English.translation()
     }
 
     fn select_texts(html: &str, selector: &str) -> Vec<String> {
@@ -1435,7 +1573,7 @@ mod tests {
             let html = &page.body;
             assert_eq!(
                 select_texts(html, "h1"),
-                [format!("Tram {TRAM_LINE}: {}", period.title())]
+                [format!("Tram {TRAM_LINE}: {}", period.title(en()))]
             );
             assert_eq!(
                 select_attributes(html, "#period-stats thead th[data-kind]", "data-kind"),
@@ -1655,13 +1793,13 @@ mod tests {
         let default = get(&db, "/").await.body;
         assert_eq!(
             select_texts(&default, "#charts nav a[aria-current=page]"),
-            [Range::default().label()]
+            [en().range(Range::default())]
         );
 
         let html = get(&db, "/?range=week").await.body;
         assert_eq!(
             select_texts(&html, "#charts nav a[aria-current=page]"),
-            [Range::Week.label()]
+            [en().range(Range::Week)]
         );
         assert_eq!(
             select_attributes(&html, "#charts nav a", "href"),
@@ -1791,7 +1929,7 @@ mod tests {
         };
         let html = chart_figure(
             Metric::AverageSpeed.slug(),
-            Metric::AverageSpeed.label(),
+            en().metric(Metric::AverageSpeed),
             "last day",
             Range::Day.slug(),
             &rendered,
@@ -1877,7 +2015,7 @@ mod tests {
             let page = get(&db, &period.path()).await;
             assert_eq!(page.status, StatusCode::OK, "{}", period.path());
             let html = &page.body;
-            assert_eq!(select_texts(html, "h1"), [period.title()]);
+            assert_eq!(select_texts(html, "h1"), [period.title(en())]);
             assert_eq!(
                 select_attributes(html, "#period-stats thead th[data-kind]", "data-kind"),
                 ["all", "bus"]
@@ -2140,7 +2278,7 @@ mod tests {
             .body;
         assert_eq!(
             select_texts(&html, "h1"),
-            [format!("Data quality: {}", day.title())]
+            [format!("Data quality: {}", day.title(en()))]
         );
         assert_eq!(
             text(&html, "#fetch-failures tr[data-source=mpk-positions] td"),
@@ -2282,7 +2420,7 @@ mod tests {
             select_texts(&html, "h1"),
             [format!(
                 "Data quality: Bus {OTHER_BUS_LINE}, {}",
-                day.title()
+                day.title(en())
             )]
         );
         assert_eq!(text(&html, "#invalid-positions tbody tr td"), "0%");
@@ -2367,6 +2505,95 @@ mod tests {
         let unaligned =
             ChartStep::Minutes(1).starts(start(2026, 1, 1) + 30, start(2026, 1, 1) + 150, &tz);
         assert_eq!(unaligned.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn speaks_the_language_the_browser_prefers() {
+        let db = db_with_a_bus().await;
+        let page = get_in(&db, "/", POLISH_BROWSER).await;
+        assert_eq!(page.status, StatusCode::OK);
+        assert_eq!(header_value(&page, header::CONTENT_LANGUAGE), Some("pl"));
+        assert_eq!(
+            header_value(&page, header::VARY),
+            Some(header::ACCEPT_LANGUAGE.as_str())
+        );
+        let html = &page.body;
+        assert_eq!(select_attributes(html, "html", "lang"), ["pl"]);
+        assert_eq!(select_texts(html, "h1"), ["Statystyki MPK Wrocław"]);
+        assert_eq!(
+            select_texts(html, "#charts nav a[aria-current=page]"),
+            ["Ostatnia doba"]
+        );
+        let bus = Kind::Vehicle(VehicleType::Bus);
+        assert_eq!(
+            cells(html, bus, Metric::AverageSpeed),
+            vec!["36,0"; Range::ALL.len()]
+        );
+        assert_eq!(select_texts(html, "#stats-bus caption"), ["Autobusy"]);
+        assert_eq!(
+            series_names(&hover_data(html, Metric::AverageSpeed.slug())),
+            ["Wszystkie pojazdy", "Autobusy"]
+        );
+        assert_eq!(
+            select_texts(html, "#history a")[..2],
+            ["Dzisiaj", "Wczoraj"]
+        );
+
+        for accept_language in ["", "de-DE,de;q=0.9", "pl;q=0"] {
+            let page = get_in(&db, "/", accept_language).await;
+            assert_eq!(
+                header_value(&page, header::CONTENT_LANGUAGE),
+                Some("en"),
+                "{accept_language}"
+            );
+            assert_eq!(select_texts(&page.body, "h1"), [en().text(Text::Title)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn translates_period_pages_and_charts() {
+        let db = db_with_quality_counts().await;
+        let pl = Language::Polish.translation();
+        let day = Period::containing(PeriodKind::Day, local_date(QUALITY_RECENTLY)).unwrap();
+        let html = get_in(&db, &day.path(), POLISH_BROWSER).await.body;
+        let title = day.title(pl);
+        assert_eq!(select_texts(&html, "h1"), [capitalized(&title)]);
+        assert_eq!(
+            select_texts(&html, "#chart-average-speed figcaption"),
+            [format!("Średnia prędkość (km/h), {title}")]
+        );
+        assert_eq!(select_texts(&html, "#previous"), ["← Poprzedni dzień"]);
+        assert_eq!(select_texts(&html, "#quality-link"), ["Jakość danych"]);
+
+        let quality = get_in(
+            &db,
+            &format!("{OVERVIEW_QUALITY_PATH}?range=hour"),
+            POLISH_BROWSER,
+        )
+        .await
+        .body;
+        assert_eq!(
+            text(
+                &quality,
+                "#fetch-failures tr[data-source=mpk-positions] td[data-range=hour]"
+            ),
+            "33,3%"
+        );
+        let failed = hover_data(&quality, "failed-downloads");
+        assert_eq!(series_names(&failed), ["Pozycje MPK"]);
+        let last = failed["steps"].as_array().unwrap().last().unwrap();
+        assert_eq!(step_texts(last), ["33,3%"]);
+
+        let chart = get_in(&db, "/charts/average-speed.svg?range=week", POLISH_BROWSER).await;
+        assert_eq!(chart.status, StatusCode::OK);
+        assert_eq!(header_value(&chart, header::CONTENT_LANGUAGE), Some("pl"));
+        for expected in ["Średnia prędkość (km/h)", "Brak danych"] {
+            assert!(
+                chart.body.lines().any(|line| line == expected),
+                "{expected}: {}",
+                chart.body
+            );
+        }
     }
 
     #[tokio::test]

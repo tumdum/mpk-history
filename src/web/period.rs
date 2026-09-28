@@ -3,6 +3,7 @@ use jiff::civil::{Date, ISOWeekDate, Weekday};
 use jiff::tz::TimeZone;
 use jiff::{Span, Timestamp};
 
+use super::i18n::{ChartTime, Translation};
 use super::{ChartSpec, ChartStep};
 use crate::charts::TickStep;
 
@@ -52,15 +53,6 @@ impl PeriodKind {
             PeriodKind::Day => None,
             PeriodKind::Week | PeriodKind::Month => Some(PeriodKind::Day),
             PeriodKind::Year => Some(PeriodKind::Month),
-        }
-    }
-
-    pub fn plural_label(self) -> &'static str {
-        match self {
-            PeriodKind::Day => "Days",
-            PeriodKind::Week => "Weeks",
-            PeriodKind::Month => "Months",
-            PeriodKind::Year => "Years",
         }
     }
 }
@@ -150,35 +142,29 @@ impl Period {
         })
     }
 
-    pub fn title(self) -> String {
+    /// As it reads inside a sentence, which in some languages starts in lower case.
+    pub fn title(self, tr: &dyn Translation) -> String {
         match self.kind {
-            PeriodKind::Day => self.start.strftime("%A, %-d %B %Y").to_string(),
-            PeriodKind::Week => {
-                let week = self.start.iso_week_date();
-                format!("Week {}, {}", week.week(), week.year())
-            }
-            PeriodKind::Month => self.start.strftime("%B %Y").to_string(),
+            PeriodKind::Day => tr.day(self.start),
+            PeriodKind::Week => tr.week(self.start.iso_week_date()),
+            PeriodKind::Month => tr.month(self.start),
             PeriodKind::Year => self.start.strftime(YEAR_FORMAT).to_string(),
         }
     }
 
-    pub fn subtitle(self) -> Result<Option<String>> {
+    pub fn subtitle(self, tr: &dyn Translation) -> Result<Option<String>> {
         let PeriodKind::Week = self.kind else {
             return Ok(None);
         };
         let last_day = self.end_date()?.yesterday()?;
-        Ok(Some(format!(
-            "{} – {}",
-            self.start.strftime("%-d %B"),
-            last_day.strftime("%-d %B %Y")
-        )))
+        Ok(Some(tr.week_days(self.start, last_day)))
     }
 
-    pub fn short_label(self) -> String {
+    pub fn short_label(self, tr: &dyn Translation) -> String {
         match self.kind {
-            PeriodKind::Day => self.start.strftime("%a %-d").to_string(),
-            PeriodKind::Week => format!("Week {}", self.start.iso_week_date().week()),
-            PeriodKind::Month => self.start.strftime("%B").to_string(),
+            PeriodKind::Day => tr.day_short(self.start),
+            PeriodKind::Week => tr.week_short(self.start.iso_week_date()),
+            PeriodKind::Month => tr.month_short(self.start),
             PeriodKind::Year => self.start.strftime(YEAR_FORMAT).to_string(),
         }
     }
@@ -224,26 +210,26 @@ impl Period {
             PeriodKind::Day => ChartSpec {
                 step: ChartStep::Minutes(15),
                 tick_step: TickStep::Hours(3),
-                tick_format: "%H:%M",
-                hover_format: "%H:%M",
+                tick: ChartTime::Time,
+                hover: ChartTime::Time,
             },
             PeriodKind::Week => ChartSpec {
                 step: ChartStep::Hours(1),
                 tick_step: TickStep::Days(1),
-                tick_format: "%a %d.%m",
-                hover_format: "%a %d.%m %H:%M",
+                tick: ChartTime::WeekdayDayMonth,
+                hover: ChartTime::WeekdayDayMonthTime,
             },
             PeriodKind::Month => ChartSpec {
                 step: ChartStep::Hours(6),
                 tick_step: TickStep::Days(5),
-                tick_format: "%d.%m",
-                hover_format: "%a %d.%m %H:%M",
+                tick: ChartTime::DayMonth,
+                hover: ChartTime::WeekdayDayMonthTime,
             },
             PeriodKind::Year => ChartSpec {
                 step: ChartStep::Days,
                 tick_step: TickStep::Months(1),
-                tick_format: "%b",
-                hover_format: "%a %d.%m.%Y",
+                tick: ChartTime::Month,
+                hover: ChartTime::WeekdayDate,
             },
         }
     }
@@ -254,6 +240,7 @@ mod tests {
     use jiff::civil::date;
 
     use super::*;
+    use crate::web::i18n::Language;
 
     const WARSAW: &str = "Europe/Warsaw";
     const HOUR_SECS: i64 = 60 * 60;
@@ -402,28 +389,53 @@ mod tests {
 
     #[test]
     fn names_periods_for_people() {
+        let en = Language::English.translation();
         assert_eq!(
-            period(PeriodKind::Day, "2026-09-27").title(),
+            period(PeriodKind::Day, "2026-09-27").title(en),
             "Sunday, 27 September 2026"
         );
         let week = period(PeriodKind::Week, "2026-W39");
-        assert_eq!(week.title(), "Week 39, 2026");
+        assert_eq!(week.title(en), "Week 39, 2026");
         assert_eq!(
-            week.subtitle().unwrap().as_deref(),
+            week.subtitle(en).unwrap().as_deref(),
             Some("21 September – 27 September 2026")
         );
         assert_eq!(
-            period(PeriodKind::Month, "2026-09").title(),
+            period(PeriodKind::Month, "2026-09").title(en),
             "September 2026"
         );
-        assert_eq!(period(PeriodKind::Year, "2026").title(), "2026");
+        assert_eq!(period(PeriodKind::Year, "2026").title(en), "2026");
         assert_eq!(
-            period(PeriodKind::Day, "2026-09-27").short_label(),
+            period(PeriodKind::Day, "2026-09-27").short_label(en),
             "Sun 27"
         );
         assert_eq!(
-            period(PeriodKind::Month, "2026-09").subtitle().unwrap(),
+            period(PeriodKind::Month, "2026-09").subtitle(en).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn names_periods_in_polish() {
+        let pl = Language::Polish.translation();
+        assert_eq!(
+            period(PeriodKind::Day, "2026-09-27").title(pl),
+            "niedziela, 27 września 2026"
+        );
+        let week = period(PeriodKind::Week, "2026-W39");
+        assert_eq!(week.title(pl), "tydzień 39, 2026");
+        assert_eq!(
+            week.subtitle(pl).unwrap().as_deref(),
+            Some("21 września – 27 września 2026")
+        );
+        assert_eq!(
+            period(PeriodKind::Month, "2026-09").title(pl),
+            "wrzesień 2026"
+        );
+        assert_eq!(period(PeriodKind::Year, "2026").title(pl), "2026");
+        assert_eq!(
+            period(PeriodKind::Month, "2026-09").short_label(pl),
+            "wrzesień"
         );
     }
 }

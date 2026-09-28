@@ -46,6 +46,35 @@ yellow and pink are too light on the white chart. Swapping a color means checkin
 whole set again. Every chart with two or more lines also has a legend, and hovering
 names each value, so color is never the only cue.
 
+## Languages
+
+The pages are in English and Polish. Each request picks the language from the
+browser's `Accept-Language` header: the supported language with the highest weight
+wins (`pl-PL` counts as `pl`), and English is used when none of the listed languages is
+supported or the header is missing. The same URL serves both, so responses carry
+`Content-Language` and `Vary: Accept-Language`, and `<html lang>` is set. Chart images
+(`/charts/…`) follow the header too.
+
+All text lives in `src/web/i18n/`, one file per language (`en.rs`, `pl.rs`). Each one
+implements the `Translation` trait from `src/web/i18n.rs`, so a missing string is a
+compile error, not an English leftover. Besides plain strings it builds the text that
+differs between languages in form, not just in words:
+
+- Dates: jiff only knows English names, so Polish has its own weekday and month names,
+  in the nominative ("wrzesień 2026") and in the genitive inside a date ("27 września
+  2026").
+- Numbers use the language's decimal separator (`36,0`, `33,3%`), in tables, hover
+  values and chart axes.
+- Whole phrases per period kind ("Statystyki tego tygodnia", "← Poprzedni miesiąc")
+  instead of a noun glued into a sentence, so each language can inflect it.
+
+Period titles are written as they read inside a sentence; in Polish that starts in
+lower case ("Autobus 136: wrzesień 2026"). The code capitalizes them where they stand
+alone: headings, breadcrumbs and the list of days or months.
+
+To add a language, add a variant to `Language` with its tag, and a file implementing
+`Translation`.
+
 ## Vehicles and lines
 
 Every statistics page and chart above can be limited to one vehicle type or one line
@@ -209,7 +238,9 @@ stored in the database, so this happens after every restart.
   don't reach the internet.
 - `tests/web_e2e.rs`: end-to-end tests in headless Chrome with `thirtyfour`, including
   moving the mouse over chart steps, using the arrow keys, going through the calendar
-  pages, and the data quality pages and their charts. They need
+  pages, the data quality pages and their charts, and a browser set to Polish getting
+  Polish pages. Chrome's languages are set for each test, so the system language
+  doesn't matter. They need
   Google Chrome. The matching chromedriver is downloaded on the first run; set
   `CHROMEDRIVER` (and `CHROME` for the browser) to use your own binaries instead, as
   the CI does.

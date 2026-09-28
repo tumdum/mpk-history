@@ -27,7 +27,6 @@ const MIN_SERIES_FOR_LEGEND: usize = 2;
 const HEADROOM: f64 = 1.4;
 const MIN_Y_MAX_FOR_WHOLE_LABELS: f64 = 10.0;
 const EMPTY_Y_MAX: f64 = 1.0;
-const NO_DATA: &str = "No data";
 
 const SURFACE: RGBColor = RGBColor(0xfc, 0xfc, 0xfb);
 const TEXT_SECONDARY: RGBColor = RGBColor(0x52, 0x51, 0x4e);
@@ -77,12 +76,19 @@ impl TickStep {
     }
 }
 
+/// The text a chart draws, in the reader's language and time zone.
+pub trait Labels {
+    fn tick(&self, unix: i64) -> String;
+    fn hover(&self, unix: i64) -> String;
+    fn number(&self, value: f64, decimals: usize) -> String;
+    fn no_data(&self) -> &str;
+}
+
 pub struct LineChart<'a> {
     pub from_unix: i64,
     pub to_unix: i64,
     pub y_label: &'a str,
-    pub tick_format: &'a str,
-    pub hover_format: &'a str,
+    pub labels: &'a dyn Labels,
     pub tick_step: TickStep,
     pub series: Vec<Series>,
 }
@@ -165,9 +171,9 @@ fn draw(root: &DrawingArea<SVGBackend, Shift>, chart: &LineChart) -> Result<Hove
             (chart.from_unix..chart.to_unix).with_key_points(ticks),
             0.0..y_max,
         )?;
-    let format_time = |unix: &i64| local_time(*unix, chart.tick_format);
+    let format_time = |unix: &i64| chart.labels.tick(*unix);
     let y_decimals = usize::from(y_max < MIN_Y_MAX_FOR_WHOLE_LABELS);
-    let format_value = |value: &f64| format!("{value:.y_decimals$}");
+    let format_value = |value: &f64| chart.labels.number(*value, y_decimals);
     plot.configure_mesh()
         .x_labels(tick_count)
         .y_labels(Y_LABELS)
@@ -211,7 +217,7 @@ fn draw(root: &DrawingArea<SVGBackend, Shift>, chart: &LineChart) -> Result<Hove
             .into_font()
             .color(&TEXT_SECONDARY)
             .pos(Pos::new(HPos::Center, VPos::Center));
-        root.draw(&Text::new(NO_DATA, center, style))?;
+        root.draw(&Text::new(chart.labels.no_data(), center, style))?;
         return Ok(hover(&plot, chart, HoverSteps::Skip));
     }
     if chart.series.len() >= MIN_SERIES_FOR_LEGEND {
@@ -266,7 +272,7 @@ fn hover(plot: &Plot, chart: &LineChart, steps: HoverSteps) -> Hover {
 fn hover_step(plot: &Plot, chart: &LineChart, index: usize, unix: i64) -> HoverStep {
     HoverStep {
         x: plot.backend_coord(&(unix, 0.0)).0,
-        label: local_time(unix, chart.hover_format),
+        label: chart.labels.hover(unix),
         values: chart
             .series
             .iter()
@@ -322,18 +328,6 @@ fn time_ticks(from_unix: i64, to_unix: i64, step: TickStep) -> Result<Vec<i64>> 
     Ok(ticks)
 }
 
-fn local_time(unix: i64, format: &str) -> String {
-    Timestamp::from_second(unix).map_or_else(
-        |_| String::new(),
-        |timestamp| {
-            timestamp
-                .to_zoned(TimeZone::system())
-                .strftime(format)
-                .to_string()
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,14 +339,46 @@ mod tests {
     const MINUTE_SECS: i64 = 60;
     const HOUR_SECS: i64 = 60 * MINUTE_SECS;
     const MISSING: &str = "-";
+    const NO_DATA: &str = "No data";
+
+    struct TestLabels;
+
+    impl Labels for TestLabels {
+        fn tick(&self, unix: i64) -> String {
+            local_time(unix, TIME_FORMAT)
+        }
+
+        fn hover(&self, unix: i64) -> String {
+            local_time(unix, TIME_FORMAT)
+        }
+
+        fn number(&self, value: f64, decimals: usize) -> String {
+            format!("{value:.decimals$}")
+        }
+
+        fn no_data(&self) -> &str {
+            NO_DATA
+        }
+    }
+
+    fn local_time(unix: i64, format: &str) -> String {
+        Timestamp::from_second(unix).map_or_else(
+            |_| String::new(),
+            |timestamp| {
+                timestamp
+                    .to_zoned(TimeZone::system())
+                    .strftime(format)
+                    .to_string()
+            },
+        )
+    }
 
     fn chart(series: Vec<Series>) -> LineChart<'static> {
         LineChart {
             from_unix: 0,
             to_unix: 600,
             y_label: "km/h",
-            tick_format: TIME_FORMAT,
-            hover_format: TIME_FORMAT,
+            labels: &TestLabels,
             tick_step: TickStep::Minutes(TICK_MINUTES),
             series,
         }

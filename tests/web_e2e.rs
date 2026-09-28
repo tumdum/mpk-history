@@ -13,6 +13,7 @@ use mpk_history::mpk::{Position, VehicleType};
 use mpk_history::web::{self, Clock};
 use serde::Deserialize;
 use tempfile::TempDir;
+use thirtyfour::common::capabilities::chromium::ChromiumLikeCapabilities;
 use thirtyfour::manager::BrowserKind;
 use thirtyfour::prelude::*;
 use tokio::net::TcpListener;
@@ -25,6 +26,10 @@ const CHROME_ARGS: [&str; 3] = ["--headless=new", "--disable-gpu", "--window-siz
 const DRIVER_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const DATABASE_FILE: &str = "mpk-history.sqlite";
 const TITLE: &str = "MPK Wrocław statistics";
+const CHROME_PREFERENCES: &str = "prefs";
+const ACCEPT_LANGUAGES_PREFERENCE: &str = "intl.accept_languages";
+const ENGLISH_BROWSER: &str = "en-US,en";
+const POLISH_BROWSER: &str = "pl-PL,pl,en-US,en";
 
 const NOW: i64 = 1_800_000_000;
 const FETCH_SECS: i64 = 10;
@@ -96,9 +101,17 @@ where
     F: FnOnce(WebDriver, String) -> Fut,
     Fut: Future<Output = WebDriverResult<()>>,
 {
+    in_browser_speaking(ENGLISH_BROWSER, test).await;
+}
+
+async fn in_browser_speaking<F, Fut>(accept_languages: &str, test: F)
+where
+    F: FnOnce(WebDriver, String) -> Fut,
+    Fut: Future<Output = WebDriverResult<()>>,
+{
     let server = TestServer::start().await;
     let url = server.url.clone();
-    browser()
+    browser(accept_languages)
         .await
         .run_and_quit(|driver| test(driver, url))
         .await
@@ -207,11 +220,17 @@ fn non_empty_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-async fn browser() -> WebDriver {
+async fn browser(accept_languages: &str) -> WebDriver {
     let mut capabilities = DesiredCapabilities::chrome();
     for arg in CHROME_ARGS {
         capabilities.add_arg(arg).unwrap();
     }
+    capabilities
+        .add_experimental_option(
+            CHROME_PREFERENCES,
+            serde_json::json!({ ACCEPT_LANGUAGES_PREFERENCE: accept_languages }),
+        )
+        .unwrap();
     if let Some(chrome) = non_empty_env(CHROME_ENV) {
         capabilities.set_binary(&chrome).unwrap();
     }
@@ -868,6 +887,42 @@ async fn quality_page_shows_when_downloads_failed() {
         );
         let (_, shown) = hover_step(&driver, "failed-downloads", failed_at - MINUTE_SECS).await?;
         assert_eq!(shown.rows, rows(&[("MPK positions", MISSING_VALUE)]));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn pages_follow_the_language_of_the_browser() {
+    in_browser_speaking(POLISH_BROWSER, |driver, url| async move {
+        driver.goto(format!("{url}/?range=hour")).await?;
+        assert_eq!(driver.title().await?, "Statystyki MPK Wrocław");
+        let page = driver.find(By::Tag("html")).await?;
+        assert_eq!(page.attr("lang").await?.as_deref(), Some("pl"));
+        assert_eq!(selected_range(&driver).await?, "Ostatnia godzina");
+        assert_eq!(cell(&driver, "bus", "average-speed", "day").await?, "27,0");
+
+        let speed_at = NOW - 15 * MINUTE_SECS;
+        let (_, shown) = hover_step(&driver, "average-speed", speed_at).await?;
+        assert_eq!(shown.time, hour_label(speed_at));
+        assert_eq!(
+            shown.rows,
+            rows(&[
+                ("Wszystkie pojazdy", "18,0"),
+                ("Autobusy", "36,0"),
+                ("Tramwaje", "0,0")
+            ])
+        );
+
+        click(&driver, "#history a").await?;
+        assert!(current_path(&driver).await?.starts_with("/day/"));
+        assert_eq!(text(&driver, "#previous").await?, "← Poprzedni dzień");
+        driver
+            .find(By::LinkText("Jakość danych"))
+            .await?
+            .click()
+            .await?;
+        assert!(heading(&driver).await?.starts_with("Jakość danych: "));
         Ok(())
     })
     .await;

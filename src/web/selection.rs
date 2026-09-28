@@ -1,16 +1,16 @@
 use anyhow::Result;
 use maud::{Markup, html};
 
+use super::i18n::{Text, Translation, capitalized};
 use super::period::Period;
 use super::quality::{OVERVIEW_QUALITY_PATH, QUALITY_SEGMENT};
-use super::{OVERVIEW_PATH, Range, kind_color, kind_label, kind_slug};
+use super::{OVERVIEW_PATH, Range, kind_color, kind_slug};
 use crate::charts::RGBColor;
 use crate::db::{Db, StoredLine};
 use crate::mpk::VehicleType;
 use crate::stats::{Group, Kind};
 
 const UNRESERVED_PATH_MARKS: &[u8] = b"-._~";
-const LINES_HEADING: &str = "Lines";
 
 #[derive(Debug, Clone)]
 pub(super) enum SelectionKey {
@@ -83,18 +83,18 @@ impl Selection {
         format!("{}/{QUALITY_SEGMENT}", self.period_path(period))
     }
 
-    pub(super) fn label(&self) -> String {
+    pub(super) fn label(&self, tr: &dyn Translation) -> String {
         match self {
-            Selection::All => kind_label(Kind::All).to_owned(),
-            Selection::Type(vehicle_type) => kind_label(Kind::Vehicle(*vehicle_type)).to_owned(),
-            Selection::Line(line) => line_label(line),
+            Selection::All => tr.kind(Kind::All).to_owned(),
+            Selection::Type(vehicle_type) => tr.kind(Kind::Vehicle(*vehicle_type)).to_owned(),
+            Selection::Line(line) => tr.line(line.vehicle_type, &line.name),
         }
     }
 
-    pub(super) fn heading(&self, what: &str) -> String {
+    pub(super) fn heading(&self, tr: &dyn Translation, what: &str) -> String {
         match self {
-            Selection::All => what.to_owned(),
-            Selection::Type(_) | Selection::Line(_) => format!("{}: {what}", self.label()),
+            Selection::All => capitalized(what),
+            Selection::Type(_) | Selection::Line(_) => format!("{}: {what}", self.label(tr)),
         }
     }
 
@@ -106,21 +106,22 @@ impl Selection {
         }
     }
 
-    pub(super) fn subjects(&self) -> Vec<Subject> {
+    pub(super) fn subjects(&self, tr: &dyn Translation) -> Vec<Subject> {
         match self {
-            Selection::All => std::iter::once(Subject::kind(Kind::All, Visibility::Always))
+            Selection::All => std::iter::once(Subject::kind(tr, Kind::All, Visibility::Always))
                 .chain(VehicleType::ALL.into_iter().map(|vehicle_type| {
-                    Subject::kind(Kind::Vehicle(vehicle_type), Visibility::WithVehicles)
+                    Subject::kind(tr, Kind::Vehicle(vehicle_type), Visibility::WithVehicles)
                 }))
                 .collect(),
             Selection::Type(vehicle_type) => vec![Subject::kind(
+                tr,
                 Kind::Vehicle(*vehicle_type),
                 Visibility::Always,
             )],
             Selection::Line(line) => vec![Subject {
                 group: Group::Line(line.id),
                 slug: format!("{}-{}", line.vehicle_type.as_str(), line.name),
-                label: line_label(line),
+                label: self.label(tr),
                 color: kind_color(Kind::Vehicle(line.vehicle_type)),
                 visibility: Visibility::Always,
             }],
@@ -144,11 +145,11 @@ pub(super) struct Subject {
 }
 
 impl Subject {
-    fn kind(kind: Kind, visibility: Visibility) -> Self {
+    fn kind(tr: &dyn Translation, kind: Kind, visibility: Visibility) -> Self {
         Self {
             group: Group::Kind(kind),
             slug: kind_slug(kind).to_owned(),
-            label: kind_label(kind).to_owned(),
+            label: tr.kind(kind).to_owned(),
             color: kind_color(kind),
             visibility,
         }
@@ -191,7 +192,12 @@ impl Page {
     }
 }
 
-pub(super) fn vehicles_nav(selection: &Selection, page: Page, lines: &[StoredLine]) -> Markup {
+pub(super) fn vehicles_nav(
+    tr: &dyn Translation,
+    selection: &Selection,
+    page: Page,
+    lines: &[StoredLine],
+) -> Markup {
     let types = VehicleType::ALL.into_iter().filter(|vehicle_type| {
         selection.vehicle_type() == Some(*vehicle_type)
             || lines.iter().any(|line| line.vehicle_type == *vehicle_type)
@@ -200,17 +206,22 @@ pub(super) fn vehicles_nav(selection: &Selection, page: Page, lines: &[StoredLin
         .chain(types.map(Selection::Type))
         .collect();
     html! {
-        nav #vehicles aria-label="Vehicles" {
+        nav #vehicles aria-label=(tr.text(Text::Vehicles)) {
             @for option in &options {
                 a href=(page.path(option)) aria-current=[(option == selection).then_some("page")] {
-                    (option.label())
+                    (option.label(tr))
                 }
             }
         }
     }
 }
 
-pub(super) fn lines_section(selection: &Selection, page: Page, lines: &[StoredLine]) -> Markup {
+pub(super) fn lines_section(
+    tr: &dyn Translation,
+    selection: &Selection,
+    page: Page,
+    lines: &[StoredLine],
+) -> Markup {
     let mut lines: Vec<StoredLine> = lines
         .iter()
         .filter(|line| {
@@ -231,11 +242,11 @@ pub(super) fn lines_section(selection: &Selection, page: Page, lines: &[StoredLi
     }
     html! {
         section #lines {
-            h2 { (LINES_HEADING) }
+            h2 { (tr.text(Text::Lines)) }
             @for of_type in lines.chunk_by(|a, b| a.vehicle_type == b.vehicle_type) {
                 @let kind = Kind::Vehicle(of_type[0].vehicle_type);
-                h3 { (kind_label(kind)) }
-                nav aria-label=(kind_label(kind)) data-kind=(kind_slug(kind)) {
+                h3 { (tr.kind(kind)) }
+                nav aria-label=(tr.kind(kind)) data-kind=(kind_slug(kind)) {
                     @for line in of_type {
                         @let option = Selection::Line(line.clone());
                         a href=(page.path(&option)) aria-current=[(&option == selection).then_some("page")] {
@@ -246,15 +257,6 @@ pub(super) fn lines_section(selection: &Selection, page: Page, lines: &[StoredLi
             }
         }
     }
-}
-
-fn line_label(line: &StoredLine) -> String {
-    let noun = match line.vehicle_type {
-        VehicleType::Bus => "Bus",
-        VehicleType::Tram => "Tram",
-        VehicleType::Train => "Train",
-    };
-    format!("{noun} {}", line.name)
 }
 
 fn line_order(line: &StoredLine) -> (i64, bool, u64, String) {
@@ -282,6 +284,7 @@ fn path_segment(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web::i18n::Language;
     use crate::web::period::PeriodKind;
 
     const LINE_ID: i64 = 7;
@@ -338,12 +341,18 @@ mod tests {
 
     #[test]
     fn names_selections_for_people() {
-        assert_eq!(Selection::All.label(), "All vehicles");
-        assert_eq!(Selection::Type(VehicleType::Tram).label(), "Trams");
+        let en = Language::English.translation();
+        assert_eq!(Selection::All.label(en), "All vehicles");
+        assert_eq!(Selection::Type(VehicleType::Tram).label(en), "Trams");
         let bus_line = Selection::Line(line(VehicleType::Bus, "a"));
-        assert_eq!(bus_line.label(), "Bus a");
-        assert_eq!(bus_line.heading("May 2027"), "Bus a: May 2027");
-        assert_eq!(Selection::All.heading("May 2027"), "May 2027");
+        assert_eq!(bus_line.label(en), "Bus a");
+        assert_eq!(bus_line.heading(en, "May 2027"), "Bus a: May 2027");
+        assert_eq!(Selection::All.heading(en, "May 2027"), "May 2027");
+
+        let pl = Language::Polish.translation();
+        assert_eq!(bus_line.label(pl), "Autobus a");
+        assert_eq!(bus_line.heading(pl, "maj 2027"), "Autobus a: maj 2027");
+        assert_eq!(Selection::All.heading(pl, "maj 2027"), "Maj 2027");
     }
 
     #[test]
