@@ -36,6 +36,9 @@ like `/day/2026-9-27` or `/week/2026-W54`, gives `404`. Charts are drawn on the 
 with `plotters`. Every page starts with its charts, average speed first, then the
 navigation links and the tables.
 
+Each page has a `<meta name="description">` for search engines: its heading followed by
+one translated sentence, one for statistics pages and one for data quality pages.
+
 Chart colors are chosen so that every pair of lines in a chart stays apart for the
 common kinds of color blindness, since any two lines can cross. The vehicle charts use
 blue (all vehicles), orange (buses), aqua (trams) and violet (trains); the download

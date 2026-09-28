@@ -1011,11 +1011,14 @@ async fn overview(
             (selection::lines_section(tr, &selection, page, &lines))
         }
     };
-    let title = match selection {
-        Selection::All => heading,
-        Selection::Type(_) | Selection::Line(_) => page_title(tr, &heading),
+    let head = Head {
+        description: page_description(tr, &heading, Text::StatisticsDescription),
+        title: match selection {
+            Selection::All => heading,
+            Selection::Type(_) | Selection::Line(_) => page_title(tr, &heading),
+        },
     };
-    Ok(shell(language, Caching::live()?, &title, &body))
+    Ok(shell(language, Caching::live()?, &head, &body))
 }
 
 fn history_links(today: Date) -> Result<Vec<(Relative, Period)>> {
@@ -1034,8 +1037,26 @@ fn history_links(today: Date) -> Result<Vec<(Relative, Period)>> {
     ])
 }
 
+struct Head {
+    title: String,
+    description: String,
+}
+
+impl Head {
+    fn new(tr: &dyn Translation, heading: &str, about: Text) -> Self {
+        Self {
+            title: page_title(tr, heading),
+            description: page_description(tr, heading, about),
+        }
+    }
+}
+
 fn page_title(tr: &dyn Translation, heading: &str) -> String {
     format!("{heading} – {}", tr.text(Text::Title))
+}
+
+fn page_description(tr: &dyn Translation, heading: &str, about: Text) -> String {
+    format!("{heading}. {}", tr.text(about))
 }
 
 fn updated(now: Timestamp, tz: &TimeZone) -> Markup {
@@ -1046,14 +1067,15 @@ fn updated(now: Timestamp, tz: &TimeZone) -> Markup {
     html! { time datetime=(now.to_string()) { (local) } }
 }
 
-fn shell(language: Language, caching: Caching, title: &str, body: &Markup) -> Response {
+fn shell(language: Language, caching: Caching, head: &Head, body: &Markup) -> Response {
     let markup = html! {
         (DOCTYPE)
         html lang=(language.tag()) {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) }
+                title { (head.title) }
+                meta name="description" content=(head.description);
                 style { (PreEscaped(STYLE)) }
             }
             body {
@@ -1182,7 +1204,8 @@ async fn period_page(
             (selection::lines_section(tr, &selection, page, &lines))
         }
     };
-    Ok(shell(language, caching, &page_title(tr, &heading), &body))
+    let head = Head::new(tr, &heading, Text::StatisticsDescription);
+    Ok(shell(language, caching, &head, &body))
 }
 
 fn chart_figure(
@@ -1888,6 +1911,29 @@ mod tests {
             assert_eq!(
                 select_attributes(&html, "main > *:first-child", "id"),
                 ["charts"],
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_page_has_a_description_starting_with_its_heading() {
+        let db = db_with_a_bus().await;
+        let day = containing(PeriodKind::Day).slug();
+        for (uri, text) in [
+            ("/".to_owned(), Text::StatisticsDescription),
+            ("/bus".to_owned(), Text::StatisticsDescription),
+            (format!("/day/{day}"), Text::StatisticsDescription),
+            ("/quality".to_owned(), Text::QualityDescription),
+            (format!("/day/{day}/quality"), Text::QualityDescription),
+        ] {
+            let html = get(&db, &uri).await.body;
+            let [heading] = &select_texts(&html, "h1")[..] else {
+                panic!("expected one heading on {uri}");
+            };
+            assert_eq!(
+                select_attributes(&html, "meta[name=description]", "content"),
+                [format!("{heading}. {}", en().text(text))],
                 "{uri}"
             );
         }

@@ -86,6 +86,12 @@ impl Translation for Polish {
     fn text(&self, text: Text) -> &'static str {
         match text {
             Text::Title => "Statystyki MPK Wrocław",
+            Text::StatisticsDescription => {
+                "Średnia prędkość, liczba aktywnych pojazdów i przejechany dystans autobusów i tramwajów MPK Wrocław, z wykresami."
+            }
+            Text::QualityDescription => {
+                "Nieudane pobrania i błędne pozycje GPS w danych o pojazdach MPK Wrocław."
+            }
             Text::Overview => "Przegląd",
             Text::AsOf => "Stan na ",
             Text::SoFarAsOf => "Do tej pory, stan na ",

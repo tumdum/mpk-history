@@ -15,6 +15,12 @@ impl Translation for English {
     fn text(&self, text: Text) -> &'static str {
         match text {
             Text::Title => "MPK Wrocław statistics",
+            Text::StatisticsDescription => {
+                "Average speed, active vehicles and distance driven by MPK Wrocław buses and trams, with charts."
+            }
+            Text::QualityDescription => {
+                "Failed downloads and invalid GPS positions in the MPK Wrocław vehicle data."
+            }
             Text::Overview => "Overview",
             Text::AsOf => "As of ",
             Text::SoFarAsOf => "So far, as of ",

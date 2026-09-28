@@ -8,8 +8,8 @@ use super::i18n::{Language, Neighbour, Text, Translation, capitalized};
 use super::period::{Period, PeriodKind};
 use super::selection::{self, Page, Selection, SelectionKey, Subject};
 use super::{
-    AppError, AppState, ChartLabels, GREEN, MAGENTA, MISSING_VALUE, Range, VIOLET, YELLOW,
-    chart_figure, page_title, shell, updated,
+    AppError, AppState, ChartLabels, GREEN, Head, MAGENTA, MISSING_VALUE, Range, VIOLET, YELLOW,
+    chart_figure, shell, updated,
 };
 use crate::charts::{self, LineChart, Point, RGBColor, Rendered, Series};
 use crate::db::{Db, FetchCount, PositionCount};
@@ -530,12 +530,8 @@ pub(super) async fn overview(
             (selection::lines_section(tr, &selection, page, &lines))
         }
     };
-    Ok(shell(
-        language,
-        Caching::live()?,
-        &page_title(tr, &heading),
-        &body,
-    ))
+    let head = Head::new(tr, &heading, Text::QualityDescription);
+    Ok(shell(language, Caching::live()?, &head, &body))
 }
 
 pub(super) async fn period_page(
@@ -636,7 +632,8 @@ pub(super) async fn period_page(
             (selection::lines_section(tr, &selection, page, &lines))
         }
     };
-    Ok(shell(language, caching, &page_title(tr, &heading), &body))
+    let head = Head::new(tr, &heading, Text::QualityDescription);
+    Ok(shell(language, caching, &head, &body))
 }
 
 #[cfg(test)]

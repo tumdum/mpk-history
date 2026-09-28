@@ -123,6 +123,8 @@ impl<S: Send + Sync> FromRequestParts<S> for Language {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Text {
     Title,
+    StatisticsDescription,
+    QualityDescription,
     Overview,
     AsOf,
     SoFarAsOf,
