@@ -579,11 +579,21 @@ async fn hovering_a_chart_shows_the_values_of_that_step() {
             shown.rows,
             rows(&[
                 ("All vehicles", "18.0"),
+                ("All vehicles, while moving", "36.0"),
                 ("Buses", "36.0"),
-                ("Trams", "0.0")
+                ("Buses, while moving", "36.0"),
+                ("Trams", "0.0"),
+                ("Trams, while moving", MISSING_VALUE)
             ])
         );
-        assert_eq!(visible_dots(&speed).await?, 3);
+        assert_eq!(visible_dots(&speed).await?, 5);
+        let keys = speed.find_all(By::Css(".chart-tooltip-key")).await?;
+        let mut dashed = Vec::new();
+        for key in keys {
+            let image = key.css_value("background-image").await?;
+            dashed.push(image.starts_with("repeating-linear-gradient"));
+        }
+        assert_eq!(dashed, [false, true, false, true, false, true]);
         assert!(
             tooltip(&vehicles).await?.is_none(),
             "only one tooltip at a time"
@@ -909,8 +919,11 @@ async fn pages_follow_the_language_of_the_browser() {
             shown.rows,
             rows(&[
                 ("Wszystkie pojazdy", "18,0"),
+                ("Wszystkie pojazdy, w ruchu", "36,0"),
                 ("Autobusy", "36,0"),
-                ("Tramwaje", "0,0")
+                ("Autobusy, w ruchu", "36,0"),
+                ("Tramwaje", "0,0"),
+                ("Tramwaje, w ruchu", "–")
             ])
         );
 

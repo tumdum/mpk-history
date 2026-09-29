@@ -5,6 +5,9 @@
   const DOT_RADIUS = 4;
   const TOOLTIP_GAP = 12;
   const STEP_KEYS = { ArrowLeft: -1, ArrowRight: 1 };
+  const DASHED = "dashed";
+  const DASH_PX = 4;
+  const DASH_GAP_PX = 2;
 
   function svgElement(name, attributes) {
     const element = document.createElementNS(SVG_NS, name);
@@ -55,7 +58,10 @@
       const rows = data.series.map((series, index) => {
         const row = htmlElement("div", "chart-tooltip-row");
         const key = htmlElement("span", "chart-tooltip-key");
-        key.style.background = series.color;
+        key.style.background =
+          series.stroke === DASHED
+            ? `repeating-linear-gradient(90deg, ${series.color} 0 ${DASH_PX}px, transparent ${DASH_PX}px ${DASH_PX + DASH_GAP_PX}px)`
+            : series.color;
         row.append(
           key,
           htmlElement("span", "chart-tooltip-name", series.name),

@@ -13,6 +13,8 @@ pub const BUCKET: Duration = Duration::from_mins(1);
 const COMPUTE_CHUNK: Duration = Duration::from_hours(6);
 const SAVE_DELAY: Duration = Duration::from_mins(1);
 const MAX_STEP_GAP: Duration = Duration::from_mins(1);
+const GPS_REFRESH: Duration = Duration::from_secs(15);
+const MIN_MOVING_STEP_M: f64 = 5.0;
 const MAX_PLAUSIBLE_SPEED_KMH: f64 = 120.0;
 const METERS_PER_KILOMETER: f64 = 1000.0;
 const KIND_COUNT: usize = 4;
@@ -60,6 +62,16 @@ pub struct Totals {
     peak_vehicles: u64,
     distance_m: f64,
     travel_secs: i64,
+    moving_distance_m: f64,
+    moving_secs: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Piece {
+    distance_m: f64,
+    secs: i64,
+    moving_distance_m: f64,
+    moving_secs: i64,
 }
 
 impl Totals {
@@ -69,6 +81,8 @@ impl Totals {
         self.peak_vehicles = self.peak_vehicles.max(other.peak_vehicles);
         self.distance_m += other.distance_m;
         self.travel_secs += other.travel_secs;
+        self.moving_distance_m += other.moving_distance_m;
+        self.moving_secs += other.moving_secs;
     }
 
     fn add_sample(&mut self, vehicles: u64) {
@@ -77,9 +91,11 @@ impl Totals {
         self.peak_vehicles = self.peak_vehicles.max(vehicles);
     }
 
-    fn add_step(&mut self, distance_m: f64, travel_secs: i64) {
-        self.distance_m += distance_m;
-        self.travel_secs += travel_secs;
+    fn add_step(&mut self, piece: &Piece) {
+        self.distance_m += piece.distance_m;
+        self.travel_secs += piece.secs;
+        self.moving_distance_m += piece.moving_distance_m;
+        self.moving_secs += piece.moving_secs;
     }
 
     #[must_use]
@@ -106,6 +122,13 @@ impl Totals {
     }
 
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn moving_speed_kmh(&self) -> Option<f64> {
+        (self.moving_secs > 0)
+            .then(|| self.moving_distance_m / self.moving_secs as f64 * KMH_PER_METER_PER_SECOND)
+    }
+
+    #[must_use]
     pub fn distance_km(&self) -> Option<f64> {
         (self.samples > 0).then(|| self.distance_m / METERS_PER_KILOMETER)
     }
@@ -118,6 +141,8 @@ struct LineTotals {
     peak_vehicles: u32,
     travel_secs: u32,
     distance_m: f32,
+    moving_secs: u32,
+    moving_distance_m: f32,
 }
 
 impl LineTotals {
@@ -128,6 +153,8 @@ impl LineTotals {
             peak_vehicles: 0,
             travel_secs: 0,
             distance_m: 0.0,
+            moving_secs: 0,
+            moving_distance_m: 0.0,
         }
     }
 
@@ -136,6 +163,8 @@ impl LineTotals {
         self.peak_vehicles = self.peak_vehicles.max(other.peak_vehicles);
         self.travel_secs = self.travel_secs.saturating_add(other.travel_secs);
         self.distance_m += other.distance_m;
+        self.moving_secs = self.moving_secs.saturating_add(other.moving_secs);
+        self.moving_distance_m += other.moving_distance_m;
     }
 
     fn add_sample(&mut self, vehicles: u32) {
@@ -144,11 +173,13 @@ impl LineTotals {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn add_step(&mut self, distance_m: f64, travel_secs: i64) {
-        self.distance_m += distance_m as f32;
-        self.travel_secs = self
-            .travel_secs
-            .saturating_add(u32::try_from(travel_secs).unwrap_or(u32::MAX));
+    fn add_step(&mut self, piece: &Piece) {
+        self.distance_m += piece.distance_m as f32;
+        self.travel_secs = self.travel_secs.saturating_add(saturated_secs(piece.secs));
+        self.moving_distance_m += piece.moving_distance_m as f32;
+        self.moving_secs = self
+            .moving_secs
+            .saturating_add(saturated_secs(piece.moving_secs));
     }
 
     fn totals(&self, samples: u64) -> Totals {
@@ -158,8 +189,14 @@ impl LineTotals {
             peak_vehicles: u64::from(self.peak_vehicles),
             distance_m: f64::from(self.distance_m),
             travel_secs: i64::from(self.travel_secs),
+            moving_distance_m: f64::from(self.moving_distance_m),
+            moving_secs: i64::from(self.moving_secs),
         }
     }
+}
+
+fn saturated_secs(secs: i64) -> u32 {
+    u32::try_from(secs).unwrap_or(u32::MAX)
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -559,6 +596,7 @@ fn standing(current: &TypedPathPoint) -> Travel {
         kind: Kind::Vehicle(current.vehicle_type),
         line_id: current.point.line_id,
         start_unix: current.point.first_seen_unix,
+        moving_start_unix: current.point.last_seen_unix,
         end_unix: current.point.last_seen_unix,
         distance_m: 0.0,
     }
@@ -579,10 +617,17 @@ fn step(current: &TypedPathPoint, next: &TypedPathPoint) -> Option<Travel> {
     if speed_kmh > MAX_PLAUSIBLE_SPEED_KMH {
         return None;
     }
+    let moving_start_unix = if distance_m >= MIN_MOVING_STEP_M {
+        a.first_seen_unix
+            .max(a.last_seen_unix - db::duration_secs(GPS_REFRESH))
+    } else {
+        b.first_seen_unix
+    };
     Some(Travel {
         kind: Kind::Vehicle(current.vehicle_type),
         line_id: a.line_id,
         start_unix: a.first_seen_unix,
+        moving_start_unix,
         end_unix: b.first_seen_unix,
         distance_m,
     })
@@ -592,6 +637,7 @@ struct Travel {
     kind: Kind,
     line_id: i64,
     start_unix: i64,
+    moving_start_unix: i64,
     end_unix: i64,
     distance_m: f64,
 }
@@ -602,6 +648,7 @@ fn add_travel(buckets: &mut [Bucket], from_unix: i64, to_unix: i64, travel: &Tra
     if span_secs <= 0 {
         return;
     }
+    let moving_span_secs = travel.end_unix - travel.moving_start_unix;
     let bucket_secs = db::duration_secs(BUCKET);
     let end_unix = travel.end_unix.min(to_unix);
     let mut piece_start_unix = travel.start_unix.max(from_unix);
@@ -609,11 +656,22 @@ fn add_travel(buckets: &mut [Bucket], from_unix: i64, to_unix: i64, travel: &Tra
         let piece_end_unix =
             (align_down(piece_start_unix, bucket_secs) + bucket_secs).min(end_unix);
         let secs = piece_end_unix - piece_start_unix;
-        let distance_m = travel.distance_m * secs as f64 / span_secs as f64;
+        let moving_secs = (piece_end_unix - piece_start_unix.max(travel.moving_start_unix)).max(0);
+        let moving_distance_m = if moving_secs > 0 {
+            travel.distance_m * moving_secs as f64 / moving_span_secs as f64
+        } else {
+            0.0
+        };
+        let piece = Piece {
+            distance_m: travel.distance_m * secs as f64 / span_secs as f64,
+            secs,
+            moving_distance_m,
+            moving_secs,
+        };
         let bucket = &mut buckets[bucket_index(piece_start_unix, from_unix)];
-        bucket.get_mut(travel.kind).add_step(distance_m, secs);
-        bucket.get_mut(Kind::All).add_step(distance_m, secs);
-        bucket.line_mut(travel.line_id).add_step(distance_m, secs);
+        bucket.get_mut(travel.kind).add_step(&piece);
+        bucket.get_mut(Kind::All).add_step(&piece);
+        bucket.line_mut(travel.line_id).add_step(&piece);
         piece_start_unix = piece_end_unix;
     }
 }
@@ -847,6 +905,123 @@ mod tests {
     }
 
     #[test]
+    fn moving_speed_leaves_out_standing_time() {
+        let gps_refresh_secs = db::duration_secs(GPS_REFRESH);
+        let points = [
+            point(VehicleType::Bus, 1, 0, START, START + 40),
+            point(
+                VehicleType::Bus,
+                1,
+                HUNDRED_METERS_NORTH_E6,
+                START + 50,
+                START + 50,
+            ),
+        ];
+        let [bucket] = &compute(&points, START, START + MINUTE)[..] else {
+            panic!("expected one bucket");
+        };
+        let bus = bucket.get(BUS);
+        assert_eq!(bus.travel_secs, 50);
+        assert_eq!(bus.moving_secs, gps_refresh_secs + FETCH_SECS);
+        assert_close(
+            bus.moving_speed_kmh(),
+            HUNDRED_METERS_PER_FETCH_KMH * 10.0 / 25.0,
+            SPEED_TOLERANCE_KMH,
+        );
+        assert_close(
+            bus.average_speed_kmh(),
+            HUNDRED_METERS_PER_FETCH_KMH * 10.0 / 50.0,
+            SPEED_TOLERANCE_KMH,
+        );
+    }
+
+    #[test]
+    fn moving_speed_counts_a_stale_position_as_moving() {
+        let points = moving(
+            VehicleType::Bus,
+            1,
+            START,
+            START + 50,
+            HUNDRED_METERS_NORTH_E6,
+        );
+        let [bucket] = &compute(&points, START, START + MINUTE)[..] else {
+            panic!("expected one bucket");
+        };
+        let bus = bucket.get(BUS);
+        assert_eq!(bus.moving_secs, bus.travel_secs);
+        assert_eq!(bus.moving_speed_kmh(), bus.average_speed_kmh());
+    }
+
+    #[test]
+    fn moving_speed_is_missing_for_standing_vehicles() {
+        let span_secs = db::duration_secs(db::MAX_ROW_SPAN);
+        let points = [
+            point(VehicleType::Tram, 1, 0, START, START + span_secs),
+            point(
+                VehicleType::Tram,
+                1,
+                0,
+                START + span_secs + FETCH_SECS,
+                START + span_secs + FETCH_SECS,
+            ),
+        ];
+        let total = total(&compute(&points, START, START + 11 * MINUTE));
+        assert_eq!(total.get(TRAM).average_speed_kmh(), Some(0.0));
+        assert_eq!(total.get(TRAM).moving_speed_kmh(), None);
+    }
+
+    #[test]
+    fn moving_speed_treats_gps_drift_as_standing() {
+        const THREE_METERS_NORTH_E6: i64 = 27;
+        let points = [
+            point(VehicleType::Bus, 1, 0, START, START + 20),
+            point(
+                VehicleType::Bus,
+                1,
+                THREE_METERS_NORTH_E6,
+                START + 30,
+                START + 30,
+            ),
+        ];
+        let [bucket] = &compute(&points, START, START + MINUTE)[..] else {
+            panic!("expected one bucket");
+        };
+        let bus = bucket.get(BUS);
+        assert_eq!(bus.moving_speed_kmh(), None);
+        assert!(bus.average_speed_kmh().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn puts_moving_time_in_the_minutes_it_happened() {
+        let points = [
+            point(VehicleType::Bus, 1, 0, START + 10, START + 70),
+            point(
+                VehicleType::Bus,
+                1,
+                HUNDRED_METERS_NORTH_E6,
+                START + 75,
+                START + 75,
+            ),
+        ];
+        let buckets = compute(&points, START, START + 2 * MINUTE);
+        let moving: Vec<i64> = buckets.iter().map(|b| b.get(BUS).moving_secs).collect();
+        assert_eq!(moving, [5, 15]);
+        let moving_km: Vec<f64> = buckets
+            .iter()
+            .map(|b| b.get(BUS).moving_distance_m / METERS_PER_KILOMETER)
+            .collect();
+        assert_close(Some(moving_km[0]), 0.025, 0.001);
+        assert_close(Some(moving_km[1]), 0.075, 0.001);
+        assert_close(
+            buckets[0]
+                .totals(Group::Line(VehicleType::Bus.id()))
+                .moving_speed_kmh(),
+            HUNDRED_METERS_PER_FETCH_KMH * 10.0 / 20.0,
+            SPEED_TOLERANCE_KMH,
+        );
+    }
+
+    #[test]
     fn skips_steps_after_gaps_and_implausible_jumps() {
         let points = [
             point(VehicleType::Bus, 1, 0, START, START),
@@ -1055,7 +1230,12 @@ mod tests {
         let with_vehicles = |vehicles| {
             let mut totals = Totals::default();
             totals.add_sample(vehicles);
-            totals.add_step(0.0, FETCH_SECS);
+            totals.add_step(&Piece {
+                distance_m: 0.0,
+                secs: FETCH_SECS,
+                moving_distance_m: 0.0,
+                moving_secs: 0,
+            });
             totals
         };
         let series: Vec<TimedTotals> = [0, 0, 2, 0, 0, 0]

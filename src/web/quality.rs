@@ -11,7 +11,7 @@ use super::{
     AppError, AppState, ChartLabels, GREEN, Head, MAGENTA, MISSING_VALUE, Range, VIOLET, YELLOW,
     chart_figure, shell, updated,
 };
-use crate::charts::{self, LineChart, Point, RGBColor, Rendered, Series};
+use crate::charts::{self, LineChart, Point, RGBColor, Rendered, Series, Stroke};
 use crate::db::{Db, FetchCount, PositionCount};
 use crate::fetch::Source;
 use crate::stats::{Group, Kind};
@@ -311,6 +311,7 @@ fn render_share_chart(
         .map(|series| Series {
             name: series.name,
             color: series.color,
+            stroke: Stroke::Solid,
             points: starts
                 .iter()
                 .zip(per_step(&series.minutes, starts))
@@ -329,6 +330,7 @@ fn render_share_chart(
         labels,
         tick_step: labels.spec.tick_step,
         series,
+        dashed_legend: None,
     })
 }
 

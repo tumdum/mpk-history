@@ -16,7 +16,7 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-use crate::charts::{self, Labels, LineChart, Point, RGBColor, Rendered, Series, TickStep};
+use crate::charts::{self, Labels, LineChart, Point, RGBColor, Rendered, Series, Stroke, TickStep};
 use crate::db::{self, Db};
 use crate::mpk::VehicleType;
 use crate::stats::{self, Detail, Group, Kind, Retention, StatsCache, TimedTotals, Totals};
@@ -302,23 +302,24 @@ impl Range {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Metric {
     AverageSpeed,
+    MovingSpeed,
     AverageVehicles,
     PeakVehicles,
     Distance,
 }
 
 impl Metric {
-    const ALL: [Metric; 4] = [
+    const ALL: [Metric; 5] = [
         Metric::AverageSpeed,
+        Metric::MovingSpeed,
         Metric::AverageVehicles,
         Metric::PeakVehicles,
         Metric::Distance,
     ];
-    const CHARTED: [Metric; 2] = [Metric::AverageSpeed, Metric::AverageVehicles];
-
     fn slug(self) -> &'static str {
         match self {
             Metric::AverageSpeed => "average-speed",
+            Metric::MovingSpeed => "moving-speed",
             Metric::AverageVehicles => "average-vehicles",
             Metric::PeakVehicles => "peak-vehicles",
             Metric::Distance => "distance",
@@ -327,7 +328,7 @@ impl Metric {
 
     fn decimals(self) -> usize {
         match self {
-            Metric::AverageSpeed | Metric::AverageVehicles => 1,
+            Metric::AverageSpeed | Metric::MovingSpeed | Metric::AverageVehicles => 1,
             Metric::PeakVehicles | Metric::Distance => 0,
         }
     }
@@ -336,6 +337,7 @@ impl Metric {
     fn value(self, totals: &Totals) -> Option<f64> {
         match self {
             Metric::AverageSpeed => totals.average_speed_kmh(),
+            Metric::MovingSpeed => totals.moving_speed_kmh(),
             Metric::AverageVehicles => totals.average_vehicles(),
             Metric::PeakVehicles => totals.peak_vehicles().map(|peak| peak as f64),
             Metric::Distance => totals.distance_km(),
@@ -352,12 +354,38 @@ impl Metric {
             |value| tr.number(value, self.decimals()),
         )
     }
+}
 
-    fn from_chart_file(file: &str) -> Option<Metric> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chart {
+    Speed,
+    Vehicles,
+}
+
+impl Chart {
+    const ALL: [Chart; 2] = [Chart::Speed, Chart::Vehicles];
+
+    fn metric(self) -> Metric {
+        match self {
+            Chart::Speed => Metric::AverageSpeed,
+            Chart::Vehicles => Metric::AverageVehicles,
+        }
+    }
+
+    fn dashed_metric(self) -> Option<Metric> {
+        match self {
+            Chart::Speed => Some(Metric::MovingSpeed),
+            Chart::Vehicles => None,
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        self.metric().slug()
+    }
+
+    fn from_file(file: &str) -> Option<Chart> {
         let slug = file.strip_suffix(SVG_EXTENSION)?;
-        Metric::CHARTED
-            .into_iter()
-            .find(|metric| metric.slug() == slug)
+        Chart::ALL.into_iter().find(|chart| chart.slug() == slug)
     }
 }
 
@@ -1017,12 +1045,12 @@ async fn overview(
     let chart = state.recent_range(&groups, selected, now_unix).await?;
     let shown = selection::shown(&subjects, &chart.series, |series| has_vehicles(series));
     let labels = ChartLabels::new(tr, selected.chart(), &state.tz);
-    let mut figures = Vec::with_capacity(Metric::CHARTED.len());
-    for metric in Metric::CHARTED {
-        let rendered = render_chart(metric, &shown, chart.window, &labels)?;
+    let mut figures = Vec::with_capacity(Chart::ALL.len());
+    for chart_kind in Chart::ALL {
+        let rendered = render_chart(chart_kind, &shown, chart.window, &labels)?;
         figures.push(chart_figure(
-            metric.slug(),
-            tr.metric(metric),
+            chart_kind.slug(),
+            tr.metric(chart_kind.metric()),
             tr.range_caption(selected),
             selected.slug(),
             &rendered,
@@ -1046,6 +1074,9 @@ async fn overview(
             p #updated { (tr.text(Text::AsOf)) (updated(now, &state.tz)) }
         }
         main {
+            @if let Some(map) = &map {
+                (map)
+            }
             section #charts {
                 h2 { (tr.text(Text::Charts)) }
                 nav aria-label=(tr.text(Text::ChartRange)) {
@@ -1059,9 +1090,6 @@ async fn overview(
                 @for figure in &figures {
                     (figure)
                 }
-            }
-            @if let Some(map) = &map {
-                (map)
             }
             (selection::vehicles_nav(tr, &selection, page, &lines))
             nav #history aria-label=(tr.text(Text::History)) {
@@ -1207,12 +1235,12 @@ async fn period_page(
     let title = period.title(tr);
     let path = selection.period_path(period);
     let labels = ChartLabels::new(tr, period.chart(), &state.tz);
-    let mut figures = Vec::with_capacity(Metric::CHARTED.len());
-    for metric in Metric::CHARTED {
-        let rendered = render_chart(metric, &shown, (from_unix, to_unix), &labels)?;
+    let mut figures = Vec::with_capacity(Chart::ALL.len());
+    for chart in Chart::ALL {
+        let rendered = render_chart(chart, &shown, (from_unix, to_unix), &labels)?;
         figures.push(chart_figure(
-            metric.slug(),
-            tr.metric(metric),
+            chart.slug(),
+            tr.metric(chart.metric()),
             &title,
             &path,
             &rendered,
@@ -1368,7 +1396,7 @@ async fn chart(
     file: String,
     range: Range,
 ) -> Result<Response, AppError> {
-    let Some(metric) = Metric::from_chart_file(&file) else {
+    let Some(chart) = Chart::from_file(&file) else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
     let Some(selection) = key.resolve(&state.db).await? else {
@@ -1381,7 +1409,7 @@ async fn chart(
     let totals = state.recent_range(&groups, range, now_unix).await?;
     let shown = selection::shown(&subjects, &totals.series, |series| has_vehicles(series));
     let labels = ChartLabels::new(tr, range.chart(), &state.tz);
-    let rendered = render_chart(metric, &shown, totals.window, &labels)?;
+    let rendered = render_chart(chart, &shown, totals.window, &labels)?;
     Ok((
         language_headers(language),
         Caching::live()?,
@@ -1432,18 +1460,17 @@ impl Labels for ChartLabels<'_> {
 }
 
 fn render_chart(
-    metric: Metric,
+    chart: Chart,
     shown: &[(&Subject, &Vec<TimedTotals>)],
     (from_unix, to_unix): (i64, i64),
     labels: &ChartLabels,
 ) -> Result<Rendered> {
     let step = labels.spec.step;
-    let series = shown
-        .iter()
-        .map(|(subject, series)| Series {
-            name: subject.label.clone(),
-            color: subject.color,
-            points: stats::regroup_by(series, |start_unix| step.start_of(start_unix, labels.tz))
+    let mut series = Vec::new();
+    for (subject, timed) in shown {
+        let steps = stats::regroup_by(timed, |start_unix| step.start_of(start_unix, labels.tz));
+        let points = |metric: Metric| -> Vec<Point> {
+            steps
                 .iter()
                 .map(|timed| {
                     let value = metric.value(&timed.totals);
@@ -1453,16 +1480,34 @@ fn render_chart(
                         text: metric.format_value(value, labels.tr),
                     }
                 })
-                .collect(),
-        })
-        .collect();
+                .collect()
+        };
+        series.push(Series {
+            name: subject.label.clone(),
+            color: subject.color,
+            stroke: Stroke::Solid,
+            points: points(chart.metric()),
+        });
+        let Some(dashed) = chart.dashed_metric() else {
+            continue;
+        };
+        series.push(Series {
+            name: labels.tr.while_moving(&subject.label),
+            color: subject.color,
+            stroke: Stroke::Dashed,
+            points: points(dashed),
+        });
+    }
     charts::render(&LineChart {
         from_unix,
         to_unix,
-        y_label: labels.tr.metric(metric),
+        y_label: labels.tr.metric(chart.metric()),
         labels,
         tick_step: labels.spec.tick_step,
         series,
+        dashed_legend: chart
+            .dashed_metric()
+            .map(|_| labels.tr.text(Text::WhileMoving)),
     })
 }
 
@@ -1629,6 +1674,7 @@ mod tests {
         let bus = Kind::Vehicle(VehicleType::Bus);
         let everywhere = |value: &str| vec![value.to_owned(); Range::ALL.len()];
         assert_eq!(cells(html, bus, Metric::AverageSpeed), everywhere("36.0"));
+        assert_eq!(cells(html, bus, Metric::MovingSpeed), everywhere("36.0"));
         assert_eq!(cells(html, bus, Metric::AverageVehicles), everywhere("1.0"));
         assert_eq!(cells(html, bus, Metric::PeakVehicles), everywhere("1"));
         assert_eq!(cells(html, bus, Metric::Distance), everywhere("3"));
@@ -1685,13 +1731,23 @@ mod tests {
         assert_eq!(line_cells(Metric::AverageVehicles), everywhere("1.0"));
         assert_eq!(line_cells(Metric::Distance), everywhere("3"));
         let speed = hover_data(html, Metric::AverageSpeed.slug());
-        assert_eq!(series_names(&speed), [format!("Bus {BUS_LINE}")]);
+        assert_eq!(
+            series_names(&speed),
+            [
+                format!("Bus {BUS_LINE}"),
+                format!("Bus {BUS_LINE}, while moving")
+            ]
+        );
 
         let trams = get(&db, "/tram?range=week").await.body;
         assert_eq!(select_texts(&trams, "h1"), ["Trams"]);
         assert_eq!(tables(&trams), ["stats-tram"]);
         let tram = Kind::Vehicle(VehicleType::Tram);
         assert_eq!(cells(&trams, tram, Metric::AverageSpeed), everywhere("0.0"));
+        assert_eq!(
+            cells(&trams, tram, Metric::MovingSpeed),
+            everywhere(MISSING_VALUE)
+        );
         assert_eq!(
             series_names(&hover_data(&trams, Metric::AverageVehicles.slug())),
             ["Trams"]
@@ -1706,8 +1762,11 @@ mod tests {
         assert_eq!(chart.content_type.as_deref(), Some(SVG_CONTENT_TYPE));
         let buses = get(&db, "/bus/charts/average-speed.svg?range=month").await;
         assert_eq!(
-            chart.body, buses.body,
-            "the only bus line draws like all buses"
+            chart
+                .body
+                .replace(&format!("\nBus {BUS_LINE}\n"), "\nBuses\n"),
+            buses.body,
+            "the only bus line draws like all buses, apart from its name"
         );
         assert!(!chart.body.lines().any(|line| line == "All vehicles"));
     }
@@ -1733,7 +1792,7 @@ mod tests {
             assert_eq!(period_cells(html, Metric::AverageVehicles), ["1.0"]);
             assert_eq!(
                 select_attributes(html, "figure.chart", "data-range"),
-                [path.clone(), path.clone()]
+                vec![path.clone(); Chart::ALL.len()]
             );
         }
         let week = containing_the_drive(PeriodKind::Week);
@@ -1971,7 +2030,7 @@ mod tests {
         );
         assert_eq!(
             select_texts(&html, "figure.chart .chart-plot > svg").len(),
-            2
+            Chart::ALL.len()
         );
         assert!(select_texts(&html, "body > script")[0].contains("chart-data"));
     }
@@ -2054,7 +2113,22 @@ mod tests {
             .iter()
             .map(|series| series["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["All vehicles", "Buses"]);
+        assert_eq!(
+            names,
+            [
+                "All vehicles",
+                "All vehicles, while moving",
+                "Buses",
+                "Buses, while moving"
+            ]
+        );
+        let strokes: Vec<&str> = speed["series"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|series| series["stroke"].as_str().unwrap())
+            .collect();
+        assert_eq!(strokes, ["solid", "dashed", "solid", "dashed"]);
         let steps = speed["steps"].as_array().unwrap();
         let offset_secs = TimeZone::system()
             .to_offset(Timestamp::from_second(NOW).unwrap())
@@ -2069,10 +2143,10 @@ mod tests {
                 .map(|value| value["text"].as_str().unwrap().to_owned())
                 .collect()
         };
-        assert_eq!(texts(&steps[0]), [MISSING_VALUE, MISSING_VALUE]);
+        assert_eq!(texts(&steps[0]), [MISSING_VALUE; 4]);
         assert_eq!(steps[0]["values"][0]["y"], serde_json::Value::Null);
         let last = steps.last().unwrap();
-        assert_eq!(texts(last), ["36.0", "36.0"]);
+        assert_eq!(texts(last), ["36.0"; 4]);
         assert!(last["values"][1]["y"].is_i64());
         let vehicles = hover_data(&html, Metric::AverageVehicles.slug());
         assert_eq!(
@@ -2097,6 +2171,7 @@ mod tests {
                 series: vec![charts::HoverSeries {
                     name: "</script><b>".to_owned(),
                     color: String::new(),
+                    stroke: Stroke::Solid,
                 }],
                 steps: Vec::new(),
             },
@@ -2136,11 +2211,11 @@ mod tests {
     #[tokio::test]
     async fn draws_charts_with_a_line_per_kind() {
         let db = db_with_a_bus().await;
-        for metric in Metric::CHARTED {
+        for chart_kind in Chart::ALL {
             for range in Range::ALL {
                 let uri = format!(
                     "/charts/{}{SVG_EXTENSION}?range={}",
-                    metric.slug(),
+                    chart_kind.slug(),
                     range.slug()
                 );
                 let chart = get(&db, &uri).await;
@@ -2211,7 +2286,7 @@ mod tests {
             }
             assert_eq!(
                 select_attributes(html, "figure.chart", "data-range"),
-                [period.path(), period.path()]
+                vec![period.path(); Chart::ALL.len()]
             );
         }
     }
@@ -2706,7 +2781,12 @@ mod tests {
         assert_eq!(select_texts(html, "#stats-bus caption"), ["Autobusy"]);
         assert_eq!(
             series_names(&hover_data(html, Metric::AverageSpeed.slug())),
-            ["Wszystkie pojazdy", "Autobusy"]
+            [
+                "Wszystkie pojazdy",
+                "Wszystkie pojazdy, w ruchu",
+                "Autobusy",
+                "Autobusy, w ruchu"
+            ]
         );
         assert_eq!(
             select_texts(html, "#history a")[..2],
@@ -2935,12 +3015,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shows_current_vehicles_on_a_map_below_the_charts() {
+    async fn shows_current_vehicles_on_a_map_above_the_charts() {
         let db = db_with_a_bus_and_a_tram().await;
         let html = get_with_map(&db, "/").await.body;
         assert_eq!(
             select_attributes(&html, "main > section", "id")[..2],
-            ["charts", "map"]
+            ["map", "charts"]
         );
         assert_eq!(
             select_attributes(&html, "#map .map-plot svg g", "data-kind"),

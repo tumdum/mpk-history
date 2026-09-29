@@ -145,6 +145,7 @@ pub(super) enum Text {
     VehiclesNow,
     MapDescription,
     NoVehiclesNow,
+    WhileMoving,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +182,8 @@ pub(super) trait Translation: Sync {
     fn metric(&self, metric: Metric) -> &'static str;
     fn kind(&self, kind: Kind) -> &'static str;
     fn line(&self, vehicle_type: VehicleType, name: &str) -> String;
+    /// The name of a moving speed line in a chart, as in "Buses, while moving".
+    fn while_moving(&self, name: &str) -> String;
     fn source(&self, source: Source) -> &'static str;
     fn quality_chart(&self, chart: QualityChart) -> &'static str;
     fn relative_period(&self, kind: PeriodKind, relative: Relative) -> &'static str;

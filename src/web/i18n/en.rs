@@ -41,6 +41,7 @@ impl Translation for English {
             Text::VehiclesNow => "Vehicles now",
             Text::MapDescription => "Map of Wrocław with the vehicles seen in the last 30 seconds",
             Text::NoVehiclesNow => "No vehicles right now",
+            Text::WhileMoving => "While moving",
         }
     }
 
@@ -69,6 +70,7 @@ impl Translation for English {
     fn metric(&self, metric: Metric) -> &'static str {
         match metric {
             Metric::AverageSpeed => "Average speed (km/h)",
+            Metric::MovingSpeed => "Average speed while moving (km/h)",
             Metric::AverageVehicles => "Average active vehicles",
             Metric::PeakVehicles => "Peak active vehicles",
             Metric::Distance => "Distance driven (km)",
@@ -91,6 +93,10 @@ impl Translation for English {
             VehicleType::Train => "Train",
         };
         format!("{noun} {name}")
+    }
+
+    fn while_moving(&self, name: &str) -> String {
+        format!("{name}, while moving")
     }
 
     fn source(&self, source: Source) -> &'static str {

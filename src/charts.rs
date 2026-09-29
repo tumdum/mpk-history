@@ -5,6 +5,7 @@ use plotters::coord::Shift;
 use plotters::coord::cartesian::Cartesian2d;
 use plotters::coord::combinators::WithKeyPoints;
 use plotters::coord::types::{RangedCoordf64, RangedCoordi64};
+use plotters::element::DashedPathElement;
 use plotters::prelude::*;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
 use serde::Serialize;
@@ -23,8 +24,13 @@ const NO_DATA_FONT_SIZE: u32 = 22;
 const LINE_WIDTH: u32 = 2;
 const MARKER_RADIUS: i32 = 4;
 const LEGEND_LINE_LENGTH: i32 = 16;
+const DASH_LENGTH: i32 = 6;
+const DASH_GAP: i32 = 4;
 const MIN_SERIES_FOR_LEGEND: usize = 2;
 const HEADROOM: f64 = 1.4;
+const LEGEND_ROW_PX: u32 = 20;
+const LEGEND_OFFSET_AND_PADDING_PX: u32 = 17;
+const LEGEND_GAP_PX: u32 = 8;
 const MIN_Y_MAX_FOR_WHOLE_LABELS: f64 = 10.0;
 const EMPTY_Y_MAX: f64 = 1.0;
 
@@ -39,9 +45,17 @@ pub struct Point {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Stroke {
+    Solid,
+    Dashed,
+}
+
 pub struct Series {
     pub name: String,
     pub color: RGBColor,
+    pub stroke: Stroke,
     pub points: Vec<Point>,
 }
 
@@ -91,6 +105,8 @@ pub struct LineChart<'a> {
     pub labels: &'a dyn Labels,
     pub tick_step: TickStep,
     pub series: Vec<Series>,
+    /// The one legend entry for all dashed series; dashed series get no entry of their own.
+    pub dashed_legend: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -114,6 +130,7 @@ pub struct PlotArea {
 pub struct HoverSeries {
     pub name: String,
     pub color: String,
+    pub stroke: Stroke,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -157,9 +174,10 @@ fn draw(root: &DrawingArea<SVGBackend, Shift>, chart: &LineChart) -> Result<Hove
         .fold(None, |max: Option<f64>, value| {
             Some(max.map_or(value, |max| max.max(value)))
         });
+    let legend_entries = legend_entries(chart);
     let y_max = max_value
         .filter(|max| *max > 0.0)
-        .map_or(EMPTY_Y_MAX, |max| max * HEADROOM);
+        .map_or(EMPTY_Y_MAX, |max| max * headroom(legend_entries));
     let label_style = (FONT, FONT_SIZE).into_font().color(&TEXT_SECONDARY);
     let ticks = time_ticks(chart.from_unix, chart.to_unix, chart.tick_step)?;
     let tick_count = ticks.len();
@@ -187,26 +205,7 @@ fn draw(root: &DrawingArea<SVGBackend, Shift>, chart: &LineChart) -> Result<Hove
         .light_line_style(TRANSPARENT)
         .draw()?;
 
-    for series in &chart.series {
-        let style = ShapeStyle {
-            color: series.color.to_rgba(),
-            filled: true,
-            stroke_width: LINE_WIDTH,
-        };
-        for (index, run) in runs(&series.points).into_iter().enumerate() {
-            let drawn = if let [single] = run[..] {
-                plot.draw_series([Circle::new(single, MARKER_RADIUS, style)])?
-            } else {
-                plot.draw_series(LineSeries::new(run, style))?
-            };
-            if index > 0 {
-                continue;
-            }
-            drawn.label(&series.name).legend(move |(x, y)| {
-                PathElement::new([(x, y), (x + LEGEND_LINE_LENGTH, y)], style)
-            });
-        }
-    }
+    draw_series(&mut plot, chart)?;
 
     if max_value.is_none() {
         let center = (
@@ -220,7 +219,7 @@ fn draw(root: &DrawingArea<SVGBackend, Shift>, chart: &LineChart) -> Result<Hove
         root.draw(&Text::new(chart.labels.no_data(), center, style))?;
         return Ok(hover(&plot, chart, HoverSteps::Skip));
     }
-    if chart.series.len() >= MIN_SERIES_FOR_LEGEND {
+    if legend_entries >= MIN_SERIES_FOR_LEGEND {
         plot.configure_series_labels()
             .position(SeriesLabelPosition::UpperLeft)
             .background_style(SURFACE)
@@ -229,6 +228,80 @@ fn draw(root: &DrawingArea<SVGBackend, Shift>, chart: &LineChart) -> Result<Hove
             .draw()?;
     }
     Ok(hover(&plot, chart, HoverSteps::Include))
+}
+
+fn dashed_legend<'a>(chart: &LineChart<'a>) -> Option<&'a str> {
+    let has_dashed = chart
+        .series
+        .iter()
+        .any(|series| series.stroke == Stroke::Dashed);
+    chart.dashed_legend.filter(|_| has_dashed)
+}
+
+fn legend_entries(chart: &LineChart) -> usize {
+    let solid = chart
+        .series
+        .iter()
+        .filter(|series| series.stroke == Stroke::Solid)
+        .count();
+    solid + usize::from(dashed_legend(chart).is_some())
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn headroom(legend_entries: usize) -> f64 {
+    if legend_entries < MIN_SERIES_FOR_LEGEND {
+        return HEADROOM;
+    }
+    let plot_px = f64::from(HEIGHT - 2 * MARGIN - X_LABEL_AREA);
+    let legend_px = f64::from(LEGEND_ROW_PX) * legend_entries as f64
+        + f64::from(LEGEND_OFFSET_AND_PADDING_PX + LEGEND_GAP_PX);
+    if legend_px >= plot_px {
+        return HEADROOM;
+    }
+    HEADROOM.max(plot_px / (plot_px - legend_px))
+}
+
+fn draw_series(plot: &mut Plot, chart: &LineChart) -> Result<()> {
+    for series in &chart.series {
+        let style = ShapeStyle {
+            color: series.color.to_rgba(),
+            filled: true,
+            stroke_width: LINE_WIDTH,
+        };
+        for (index, run) in runs(&series.points).into_iter().enumerate() {
+            let drawn = match (&run[..], series.stroke) {
+                ([single], _) => plot.draw_series([Circle::new(*single, MARKER_RADIUS, style)])?,
+                (_, Stroke::Solid) => plot.draw_series(LineSeries::new(run, style))?,
+                (_, Stroke::Dashed) => {
+                    plot.draw_series(DashedLineSeries::new(run, DASH_LENGTH, DASH_GAP, style))?
+                }
+            };
+            if index > 0 || series.stroke == Stroke::Dashed {
+                continue;
+            }
+            drawn.label(&series.name).legend(move |(x, y)| {
+                PathElement::new([(x, y), (x + LEGEND_LINE_LENGTH, y)], style)
+            });
+        }
+    }
+    if let Some(label) = dashed_legend(chart) {
+        let style = ShapeStyle {
+            color: TEXT_SECONDARY.to_rgba(),
+            filled: true,
+            stroke_width: LINE_WIDTH,
+        };
+        plot.draw_series(std::iter::empty::<Circle<(i64, f64), i32>>())?
+            .label(label)
+            .legend(move |(x, y)| {
+                DashedPathElement::new(
+                    [(x, y), (x + LEGEND_LINE_LENGTH, y)],
+                    DASH_LENGTH,
+                    DASH_GAP,
+                    style,
+                )
+            });
+    }
+    Ok(())
 }
 
 enum HoverSteps {
@@ -244,6 +317,7 @@ fn hover(plot: &Plot, chart: &LineChart, steps: HoverSteps) -> Hover {
         .map(|series| HoverSeries {
             name: series.name.clone(),
             color: hex(series.color),
+            stroke: series.stroke,
         })
         .collect();
     let steps = match (steps, chart.series.first()) {
@@ -381,6 +455,7 @@ mod tests {
             labels: &TestLabels,
             tick_step: TickStep::Minutes(TICK_MINUTES),
             series,
+            dashed_legend: None,
         }
     }
 
@@ -400,6 +475,7 @@ mod tests {
             Series {
                 name: "Buses".to_owned(),
                 color: RED,
+                stroke: Stroke::Solid,
                 points: points(&[
                     (0, Some(10.0)),
                     (60, Some(20.0)),
@@ -410,6 +486,7 @@ mod tests {
             Series {
                 name: "Trams".to_owned(),
                 color: BLUE,
+                stroke: Stroke::Solid,
                 points: points(&[(0, Some(15.0)), (60, Some(16.0)), (120, None), (180, None)]),
             },
         ])
@@ -490,11 +567,13 @@ mod tests {
             [
                 HoverSeries {
                     name: "Buses".to_owned(),
-                    color: "#e34948".to_owned()
+                    color: "#e34948".to_owned(),
+                    stroke: Stroke::Solid,
                 },
                 HoverSeries {
                     name: "Trams".to_owned(),
-                    color: "#2a78d6".to_owned()
+                    color: "#2a78d6".to_owned(),
+                    stroke: Stroke::Solid,
                 },
             ]
         );
@@ -534,10 +613,43 @@ mod tests {
     }
 
     #[test]
+    fn draws_dashed_series_with_one_shared_legend_entry() {
+        const WHILE_MOVING: &str = "While moving";
+        let mut chart = two_series();
+        chart.series[1].stroke = Stroke::Dashed;
+        chart.series[1].color = RED;
+        chart.dashed_legend = Some(WHILE_MOVING);
+        let rendered = render(&chart).unwrap();
+        let svg = &rendered.svg;
+        assert!(
+            has_text(svg, "Buses") && has_text(svg, WHILE_MOVING),
+            "{svg}"
+        );
+        assert!(!has_text(svg, "Trams"), "{svg}");
+        let solid = render(&two_series()).unwrap().svg;
+        assert!(
+            svg.matches("<polyline").count() > solid.matches("<polyline").count(),
+            "dashes are drawn as separate lines"
+        );
+        let strokes: Vec<Stroke> = rendered.hover.series.iter().map(|s| s.stroke).collect();
+        assert_eq!(strokes, [Stroke::Solid, Stroke::Dashed]);
+        assert_eq!(rendered.hover.series[1].name, "Trams");
+    }
+
+    #[test]
+    fn leaves_room_above_the_data_for_the_legend() {
+        assert!((headroom(1) - HEADROOM).abs() < f64::EPSILON);
+        assert!((headroom(2) - HEADROOM).abs() < f64::EPSILON);
+        assert!(headroom(3) > HEADROOM);
+        assert!(headroom(4) > headroom(3));
+    }
+
+    #[test]
     fn says_when_there_is_no_data() {
         let rendered = render(&chart(vec![Series {
             name: "Buses".to_owned(),
             color: RED,
+            stroke: Stroke::Solid,
             points: points(&[(0, None)]),
         }]))
         .unwrap();

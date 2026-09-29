@@ -29,17 +29,24 @@ once. The web page shares the database connection with the collector. It reads r
 | `/year/2026` | One calendar year |
 | `/quality?range=…` | Data quality: failed downloads and invalid GPS positions |
 | `/day/2026-09-27/quality`, `/week/…/quality`, … | Data quality of one calendar period |
-| `/charts/average-speed.svg?range=…` | The average speed chart as a plain SVG image |
+| `/charts/average-speed.svg?range=…` | The average speed chart, with the speed while moving, as a plain SVG image |
 | `/charts/average-vehicles.svg?range=…` | The average active vehicles chart as a plain SVG image |
 | `/map.svg` | The map of current vehicles as a plain SVG image |
 | `/map/wroclaw.jpg` | The map of Wrocław without vehicles, used by `/map.svg` |
 
 An unknown `range` gives `400`, an unknown chart `404`. A period in any other form,
 like `/day/2026-9-27` or `/week/2026-W54`, gives `404`. Charts are drawn on the server
-with `plotters`. Every page starts with its charts, average speed first. The overview
-pages (`/`, `/bus`, `/bus/136`, …) then show the [map of current
-vehicles](#map-of-current-vehicles), and all pages continue with the navigation links
-and the tables.
+with `plotters`. The overview pages (`/`, `/bus`, `/bus/136`, …) start with the [map
+of current vehicles](#map-of-current-vehicles). Then every page shows its charts,
+average speed first, and continues with the navigation links and the tables.
+
+The speed chart has two lines per vehicle type in the same color: a solid one for the
+average speed and a dashed one for the average speed while moving. The legend names
+each type once, next to a solid line, and has one gray dashed entry, "While moving",
+for all dashed lines. On hover each dashed line is named like "Buses, while moving".
+plotters draws every dash as its own SVG line, which makes the speed chart about
+40 KB. The space above the data grows with the number of legend entries, so the
+legend doesn't cover the lines.
 
 Each page has a `<meta name="description">` for search engines: its heading followed by
 one translated sentence, one for statistics pages and one for data quality pages.
@@ -53,8 +60,8 @@ chart uses magenta, green, violet and yellow. Both sets were checked with a pale
 validator (OKLab distance of at least 8 under simulated protanopia, deuteranopia and
 tritanopia, and at least 15 with normal vision). plotters' own palettes don't pass: their
 yellow and pink are too light on the white chart. Swapping a color means checking the
-whole set again. Every chart with two or more lines also has a legend, and hovering
-names each value, so color is never the only cue.
+whole set again. Every chart with two or more legend entries also has a legend, and
+hovering names each value, so color is never the only cue.
 
 ## Languages
 
@@ -164,7 +171,7 @@ Periods before that, or when a collector was disabled, show `–`.
 
 ## Map of current vehicles
 
-Below the charts, the overview pages show a map of Wrocław with every vehicle seen in
+Above the charts, the overview pages show a map of Wrocław with every vehicle seen in
 the last 30 seconds: buses as orange circles, trams as green squares and trains as
 violet triangles, in the colors of the charts. A vehicle type or line page shows only
 its own vehicles. Under the map is a legend with the number of vehicles of each type
@@ -242,6 +249,15 @@ All numbers are built from `vehicle_positions` rows (see
     and the speed would jump. When other vehicles were still fetched, the vehicle
     itself went missing, often during a layover at the terminus, and its time is left
     out, as is the last row of a course.
+- **Average speed while moving:** the same steps, but only the time the vehicle was
+  moving counts. Of the time at the old position, only the last 15 s (one GPS
+  update) counts as moving, since the position may be old. The rest is standing. For
+  a row seen from 0 s to 40 s and a next row at 50 s, the move takes the last 25 s.
+  Steps shorter than 5 m are GPS drift of a standing vehicle, so they count as
+  standing, like rows without a usable step. On production data such drift was about
+  13% of the time that would otherwise count as moving. The distance of a step is
+  spread evenly over its moving time only. A range where the vehicles only stood
+  shows `–`.
 - **Distance driven:** the sum of those step distances, in km.
 
 ## Caching
@@ -252,10 +268,10 @@ The server keeps totals in memory in two caches:
 |---|---|---|---|
 | Recent | 1 minute | the last 30 days, totals per vehicle type only | the overview |
 | Recent lines | 1 minute | the last day, also totals per line | the last hour and day of a line |
-| History | 15 minutes | everything, also totals per line: about 60 MB per year of data | calendar pages; the last week and month of a line |
+| History | 15 minutes | everything, also totals per line: about 75 MB per year of data | calendar pages; the last week and month of a line |
 
 Totals per line are what takes the memory: about 65 lines run at a time, and each
-keeps 24 bytes per bucket. To keep this small, a line's last week and last month come
+keeps 32 bytes per bucket. To keep this small, a line's last week and last month come
 from the history cache, so they start at the quarter hour before the exact time. For
 all vehicles and vehicle types they start at the minute.
 
