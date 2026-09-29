@@ -58,6 +58,41 @@ impl PeriodKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecentPeriod {
+    Yesterday,
+    PreviousWeek,
+    PreviousMonth,
+}
+
+impl RecentPeriod {
+    pub const ALL: [RecentPeriod; 3] = [
+        RecentPeriod::Yesterday,
+        RecentPeriod::PreviousWeek,
+        RecentPeriod::PreviousMonth,
+    ];
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            RecentPeriod::Yesterday => "yesterday",
+            RecentPeriod::PreviousWeek => "prev_week",
+            RecentPeriod::PreviousMonth => "prev_month",
+        }
+    }
+
+    fn kind(self) -> PeriodKind {
+        match self {
+            RecentPeriod::Yesterday => PeriodKind::Day,
+            RecentPeriod::PreviousWeek => PeriodKind::Week,
+            RecentPeriod::PreviousMonth => PeriodKind::Month,
+        }
+    }
+
+    pub fn period(self, today: Date) -> Result<Period> {
+        Period::containing(self.kind(), today)?.previous()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Period {
     kind: PeriodKind,
     start: Date,
@@ -349,6 +384,26 @@ mod tests {
         assert_eq!(
             step(PeriodKind::Year, "2026"),
             ("2025".to_owned(), "2027".to_owned())
+        );
+    }
+
+    #[test]
+    fn finds_recent_periods_before_today() {
+        let path = |recent: RecentPeriod, today| recent.period(today).unwrap().path();
+        let new_year = date(2027, 1, 1);
+        assert_eq!(path(RecentPeriod::Yesterday, new_year), "/day/2026-12-31");
+        assert_eq!(path(RecentPeriod::PreviousWeek, new_year), "/week/2026-W52");
+        assert_eq!(
+            path(RecentPeriod::PreviousMonth, new_year),
+            "/month/2026-12"
+        );
+        let monday = date(2026, 9, 28);
+        assert_eq!(path(RecentPeriod::PreviousWeek, monday), "/week/2026-W39");
+        let leap_day = date(2028, 3, 1);
+        assert_eq!(path(RecentPeriod::Yesterday, leap_day), "/day/2028-02-29");
+        assert_eq!(
+            path(RecentPeriod::PreviousMonth, leap_day),
+            "/month/2028-02"
         );
     }
 

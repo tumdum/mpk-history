@@ -6,7 +6,7 @@ use anyhow::Result;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
@@ -34,7 +34,7 @@ use caching::{Caching, IfNoneMatch, Revision};
 use i18n::{ChartTime, Language, Neighbour, Relative, Text, Translation, capitalized};
 pub use map::MapTiles;
 use map::{BASEMAP_PATH, MAP_PATH, SharedBasemap};
-use period::{Period, PeriodKind};
+use period::{Period, PeriodKind, RecentPeriod};
 use quality::{OVERVIEW_QUALITY_PATH, QUALITY_SEGMENT};
 use selection::{Page, Selection, SelectionKey, Subject};
 
@@ -725,6 +725,34 @@ fn quality_route(path: &str) -> String {
     format!("{path}/{QUALITY_SEGMENT}")
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PeriodView {
+    Statistics,
+    Quality,
+}
+
+impl PeriodView {
+    const ALL: [PeriodView; 2] = [PeriodView::Statistics, PeriodView::Quality];
+
+    fn route(self, path: &str) -> String {
+        match self {
+            PeriodView::Statistics => path.to_owned(),
+            PeriodView::Quality => quality_route(path),
+        }
+    }
+
+    fn path(self, selection: &Selection, period: Period) -> String {
+        match self {
+            PeriodView::Statistics => selection.period_path(period),
+            PeriodView::Quality => selection.period_quality_path(period),
+        }
+    }
+}
+
+fn recent_period_route(prefix: &str, recent: RecentPeriod, view: PeriodView) -> String {
+    view.route(&format!("{prefix}/{}", recent.slug()))
+}
+
 fn app(state: AppState) -> Router {
     let mut router = Router::new()
         .route(
@@ -807,8 +835,19 @@ fn app(state: AppState) -> Router {
                 ),
             );
     }
+    for recent in RecentPeriod::ALL {
+        for view in PeriodView::ALL {
+            router = router.route(
+                &recent_period_route("", recent, view),
+                get(move |State(state): State<AppState>| {
+                    recent_period(state, SelectionKey::All, recent, view)
+                }),
+            );
+        }
+    }
     for vehicle_type in VehicleType::ALL {
         router = vehicle_type_routes(router, vehicle_type);
+        router = vehicle_type_recent_period_routes(router, vehicle_type);
     }
     router.with_state(state)
 }
@@ -917,6 +956,38 @@ fn vehicle_type_routes(
         );
     router = vehicle_type_map_routes(router, vehicle_type);
     vehicle_type_period_routes(router, vehicle_type)
+}
+
+fn vehicle_type_recent_period_routes(
+    mut router: Router<AppState>,
+    vehicle_type: VehicleType,
+) -> Router<AppState> {
+    let (type_path, line_path) = type_and_line_paths(vehicle_type);
+    for recent in RecentPeriod::ALL {
+        for view in PeriodView::ALL {
+            router = router
+                .route(
+                    &recent_period_route(&type_path, recent, view),
+                    get(move |State(state): State<AppState>| {
+                        recent_period(state, SelectionKey::Type(vehicle_type), recent, view)
+                    }),
+                )
+                .route(
+                    &recent_period_route(&line_path, recent, view),
+                    get(
+                        move |State(state): State<AppState>, Path(line): Path<String>| {
+                            recent_period(
+                                state,
+                                SelectionKey::Line(vehicle_type, line),
+                                recent,
+                                view,
+                            )
+                        },
+                    ),
+                );
+        }
+    }
+    router
 }
 
 fn vehicle_type_map_routes(
@@ -1245,6 +1316,20 @@ fn language_headers(language: Language) -> [(header::HeaderName, HeaderValue); 2
             HeaderValue::from_static(header::ACCEPT_LANGUAGE.as_str()),
         ),
     ]
+}
+
+async fn recent_period(
+    state: AppState,
+    key: SelectionKey,
+    recent: RecentPeriod,
+    view: PeriodView,
+) -> Result<Response, AppError> {
+    let Some(selection) = key.resolve(&state.db).await? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let period = recent.period(state.today())?;
+    let target = view.path(&selection, period);
+    Ok((Caching::live()?, Redirect::temporary(&target)).into_response())
 }
 
 async fn period_page(
@@ -2434,6 +2519,44 @@ mod tests {
                 month.previous().unwrap().path(),
                 containing(PeriodKind::Year).path(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_periods_redirect_to_the_calendar_page_before_today() {
+        let db = db_with_a_bus().await;
+        let day = containing(PeriodKind::Day).previous().unwrap();
+        let week = containing(PeriodKind::Week).previous().unwrap();
+        let month = containing(PeriodKind::Month).previous().unwrap();
+        for (uri, target) in [
+            ("/yesterday", day.path()),
+            ("/prev_week", week.path()),
+            ("/prev_month", month.path()),
+            ("/prev_week/quality", format!("{}/quality", week.path())),
+            ("/tram/yesterday", format!("/tram{}", day.path())),
+            ("/bus/a/prev_month", format!("/bus/a{}", month.path())),
+            (
+                "/bus/a/yesterday/quality",
+                format!("/bus/a{}/quality", day.path()),
+            ),
+        ] {
+            let fetched = get(&db, uri).await;
+            assert_eq!(fetched.status, StatusCode::TEMPORARY_REDIRECT, "{uri}");
+            assert_eq!(
+                header_value(&fetched, header::LOCATION),
+                Some(target.as_str()),
+                "{uri}"
+            );
+            assert_eq!(
+                header_value(&fetched, header::CACHE_CONTROL),
+                Some(LIVE_CACHE_CONTROL),
+                "{uri}"
+            );
+            assert_eq!(get(&db, &target).await.status, StatusCode::OK, "{target}");
+        }
+        assert_eq!(
+            get(&db, "/bus/unknown/yesterday").await.status,
+            StatusCode::NOT_FOUND
         );
     }
 

@@ -27,8 +27,10 @@ once. The web page shares the database connection with the collector. It reads r
 | `/week/2026-W39` | One ISO week, Monday to Sunday |
 | `/month/2026-09` | One calendar month |
 | `/year/2026` | One calendar year |
+| `/yesterday`, `/prev_week`, `/prev_month` | Redirect to the day, week or month before the current one |
 | `/quality?range=…` | Data quality: failed downloads and invalid GPS positions |
 | `/day/2026-09-27/quality`, `/week/…/quality`, … | Data quality of one calendar period |
+| `/yesterday/quality`, `/prev_week/quality`, `/prev_month/quality` | Redirect to the data quality of the day, week or month before the current one |
 | `/charts/average-speed.svg?range=…` | The average speed chart, with the speed while moving, as a plain SVG image |
 | `/charts/average-vehicles.svg?range=…` | The average active vehicles chart as a plain SVG image |
 | `/map.svg` | The map of current vehicles as a plain SVG image |
@@ -132,6 +134,13 @@ week, month and year it belongs to. A week belongs to the month and year of its
 Thursday, like ISO weeks do. Week and month pages link to their days, year pages to
 their months. The overview links to today, yesterday, this and the previous week and
 month, and this year. A period that hasn't ended yet says "So far".
+
+`/yesterday`, `/prev_week` and `/prev_month` pick the period from the server's clock
+and time zone, and answer with a `307` redirect to its calendar page, so they can be
+bookmarked. They take the same vehicle type and line prefixes (`/bus/136/prev_week`)
+and `/quality` suffix as the calendar pages. The redirect is kept for a minute, like
+live pages, so for up to a minute after midnight it can still point to the period
+before.
 
 | Page | Chart step |
 |---|---|
