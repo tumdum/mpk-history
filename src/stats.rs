@@ -5,9 +5,9 @@ use anyhow::{Result, bail};
 use parking_lot::Mutex;
 
 use crate::db::{self, Db, TypedPathPoint};
-use crate::geo;
+use crate::geo::{self, MicroDegrees};
 use crate::mpk::VehicleType;
-use crate::speed::KMH_PER_METER_PER_SECOND;
+use crate::speed::{self, KMH_PER_METER_PER_SECOND};
 
 pub const BUCKET: Duration = Duration::from_mins(1);
 const COMPUTE_CHUNK: Duration = Duration::from_hours(6);
@@ -47,6 +47,17 @@ impl Kind {
 pub enum Group {
     Kind(Kind),
     Line(i64),
+}
+
+impl Group {
+    #[must_use]
+    pub fn includes(self, vehicle_type: VehicleType, line_id: i64) -> bool {
+        match self {
+            Group::Kind(Kind::All) => true,
+            Group::Kind(Kind::Vehicle(selected)) => selected == vehicle_type,
+            Group::Line(selected) => selected == line_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,17 +126,13 @@ impl Totals {
     }
 
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
     pub fn average_speed_kmh(&self) -> Option<f64> {
-        (self.travel_secs > 0)
-            .then(|| self.distance_m / self.travel_secs as f64 * KMH_PER_METER_PER_SECOND)
+        speed::kmh(self.distance_m, self.travel_secs)
     }
 
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
     pub fn moving_speed_kmh(&self) -> Option<f64> {
-        (self.moving_secs > 0)
-            .then(|| self.moving_distance_m / self.moving_secs as f64 * KMH_PER_METER_PER_SECOND)
+        speed::kmh(self.moving_distance_m, self.moving_secs)
     }
 
     #[must_use]
@@ -401,17 +408,8 @@ impl StatsCache {
         let _computing = self.computing.lock().await;
         let mut unfinished = BTreeMap::new();
         if let Some((first_unix, end_unix)) = self.missing_range(from_unix, to_unix) {
-            let chunk_secs = db::duration_secs(COMPUTE_CHUNK);
-            let margin_secs = db::duration_secs(max_step_span());
-            let mut chunk_start_unix = first_unix;
-            while chunk_start_unix < end_unix {
-                let chunk_end_unix = (chunk_start_unix + chunk_secs).min(end_unix);
-                let points = db
-                    .path_points_started_between(
-                        chunk_start_unix - margin_secs,
-                        chunk_end_unix + margin_secs,
-                    )
-                    .await?;
+            for (chunk_start_unix, chunk_end_unix) in chunks(first_unix, end_unix) {
+                let points = chunk_points(db, chunk_start_unix, chunk_end_unix).await?;
                 let minutes: Vec<TimedBucket> = bucket_starts(chunk_start_unix, chunk_end_unix)
                     .zip(compute(&points, chunk_start_unix, chunk_end_unix))
                     .map(|(start_unix, bucket)| TimedBucket { start_unix, bucket })
@@ -425,7 +423,6 @@ impl StatsCache {
                         unfinished.insert(timed.start_unix, bucket);
                     }
                 }
-                chunk_start_unix = chunk_end_unix;
             }
         }
         let mut finished = self.finished.lock();
@@ -459,6 +456,24 @@ impl StatsCache {
         let last = missing.last().unwrap_or(first);
         Some((first, last + resolution_secs))
     }
+}
+
+/// Splits a range into pieces that are each read with one query, so the collector
+/// waits at most for one of them.
+pub fn chunks(from_unix: i64, to_unix: i64) -> impl Iterator<Item = (i64, i64)> {
+    starts(from_unix, to_unix, db::duration_secs(COMPUTE_CHUNK)).map(move |start| {
+        (
+            start,
+            (start + db::duration_secs(COMPUTE_CHUNK)).min(to_unix),
+        )
+    })
+}
+
+/// The rows needed for all steps that cover any time in the range.
+pub async fn chunk_points(db: &Db, from_unix: i64, to_unix: i64) -> Result<Vec<TypedPathPoint>> {
+    let margin_secs = db::duration_secs(max_step_span());
+    db.path_points_started_between(from_unix - margin_secs, to_unix + margin_secs)
+        .await
 }
 
 fn max_step_span() -> Duration {
@@ -569,7 +584,16 @@ fn add_line_samples(
 }
 
 fn add_steps(points: &[TypedPathPoint], from_unix: i64, to_unix: i64, buckets: &mut [Bucket]) {
+    for travel in travels(points) {
+        add_travel(buckets, from_unix, to_unix, &travel);
+    }
+}
+
+/// `points` must be sorted by line, course and start, as the database returns them.
+#[must_use]
+pub fn travels(points: &[TypedPathPoint]) -> Vec<Travel> {
     let fetches = fetch_times(points, i64::MIN, i64::MAX);
+    let mut travels = Vec::with_capacity(points.len());
     for (index, current) in points.iter().enumerate() {
         let a = &current.point;
         let next = points
@@ -580,8 +604,9 @@ fn add_steps(points: &[TypedPathPoint], from_unix: i64, to_unix: i64, buckets: &
             None if collector_paused_after(&fetches, a.last_seen_unix) => standing(current),
             None => continue,
         };
-        add_travel(buckets, from_unix, to_unix, &travel);
+        travels.push(travel);
     }
+    travels
 }
 
 fn collector_paused_after(fetches: &[i64], last_seen_unix: i64) -> bool {
@@ -592,9 +617,12 @@ fn collector_paused_after(fetches: &[i64], last_seen_unix: i64) -> bool {
 }
 
 fn standing(current: &TypedPathPoint) -> Travel {
+    let position = (current.point.latitude, current.point.longitude);
     Travel {
-        kind: Kind::Vehicle(current.vehicle_type),
+        vehicle_type: current.vehicle_type,
         line_id: current.point.line_id,
+        from: position,
+        to: position,
         start_unix: current.point.first_seen_unix,
         moving_start_unix: current.point.last_seen_unix,
         end_unix: current.point.last_seen_unix,
@@ -624,8 +652,10 @@ fn step(current: &TypedPathPoint, next: &TypedPathPoint) -> Option<Travel> {
         b.first_seen_unix
     };
     Some(Travel {
-        kind: Kind::Vehicle(current.vehicle_type),
+        vehicle_type: current.vehicle_type,
         line_id: a.line_id,
+        from: (a.latitude, a.longitude),
+        to: (b.latitude, b.longitude),
         start_unix: a.first_seen_unix,
         moving_start_unix,
         end_unix: b.first_seen_unix,
@@ -633,13 +663,18 @@ fn step(current: &TypedPathPoint, next: &TypedPathPoint) -> Option<Travel> {
     })
 }
 
-struct Travel {
-    kind: Kind,
-    line_id: i64,
-    start_unix: i64,
-    moving_start_unix: i64,
-    end_unix: i64,
-    distance_m: f64,
+/// One step of a vehicle: it stood at `from` until `moving_start_unix`, then moved to
+/// `to`, where it arrived at `end_unix`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Travel {
+    pub vehicle_type: VehicleType,
+    pub line_id: i64,
+    pub from: (MicroDegrees, MicroDegrees),
+    pub to: (MicroDegrees, MicroDegrees),
+    pub start_unix: i64,
+    pub moving_start_unix: i64,
+    pub end_unix: i64,
+    pub distance_m: f64,
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -669,7 +704,9 @@ fn add_travel(buckets: &mut [Bucket], from_unix: i64, to_unix: i64, travel: &Tra
             moving_secs,
         };
         let bucket = &mut buckets[bucket_index(piece_start_unix, from_unix)];
-        bucket.get_mut(travel.kind).add_step(&piece);
+        bucket
+            .get_mut(Kind::Vehicle(travel.vehicle_type))
+            .add_step(&piece);
         bucket.get_mut(Kind::All).add_step(&piece);
         bucket.line_mut(travel.line_id).add_step(&piece);
         piece_start_unix = piece_end_unix;

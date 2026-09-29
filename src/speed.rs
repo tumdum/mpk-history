@@ -11,6 +11,12 @@ pub const SPEED_WINDOW: Duration = Duration::from_secs(60);
 pub const KMH_PER_METER_PER_SECOND: f64 = 3.6;
 
 #[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn kmh(distance_m: f64, secs: i64) -> Option<f64> {
+    (secs > 0).then(|| distance_m / secs as f64 * KMH_PER_METER_PER_SECOND)
+}
+
+#[must_use]
 pub fn average_speed_kmh(
     points: &[PathPoint],
     window_start_unix: i64,

@@ -12,10 +12,9 @@ use super::caching::Caching;
 use super::i18n::{Language, Text, Translation};
 use super::selection::{Selection, SelectionKey};
 use super::{
-    AppError, AppState, ESCAPED_SCRIPT_END_TAG_START, MISSING_VALUE, SCRIPT_END_TAG_START,
-    SVG_CONTENT_TYPE, kind_color, language_headers,
+    AppError, AppState, MISSING_VALUE, SVG_CONTENT_TYPE, css_color, kind_color, language_headers,
+    script_json,
 };
-use crate::charts::RGBColor;
 use crate::db::{PositionFilter, StoredPosition};
 use crate::map::{Basemap, Symbol, TileClient};
 use crate::mpk::VehicleType;
@@ -25,7 +24,7 @@ use crate::stats::Kind;
 pub(super) const BASEMAP_PATH: &str = "/map/wroclaw.jpg";
 pub(super) const MAP_PATH: &str = "/map.svg";
 const JPEG_CONTENT_TYPE: &str = "image/jpeg";
-const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
+pub(super) const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
 const ACTIVE_MAX_AGE: Duration = Duration::from_secs(30);
 const DOWNLOAD_RETRY: Duration = Duration::from_mins(15);
 const SPEED_UNIT: &str = "km/h";
@@ -33,8 +32,8 @@ const SPEED_DECIMALS: usize = 0;
 const LABEL_SEPARATOR: &str = ", ";
 const LEGEND_SYMBOL_PX: u32 = 14;
 const STEPS_PER_PIXEL: f64 = 10.0;
-const ATTRIBUTION: &str = "© OpenStreetMap contributors";
-const ATTRIBUTION_URL: &str = "https://www.openstreetmap.org/copyright";
+pub(super) const ATTRIBUTION: &str = "© OpenStreetMap contributors";
+pub(super) const ATTRIBUTION_URL: &str = "https://www.openstreetmap.org/copyright";
 
 pub enum MapTiles {
     Download(TileClient),
@@ -50,7 +49,7 @@ impl SharedBasemap {
         Self(Arc::new(OnceLock::from(basemap)))
     }
 
-    fn get(&self) -> Option<&Basemap> {
+    pub(super) fn get(&self) -> Option<&Basemap> {
         self.0.get()
     }
 
@@ -112,8 +111,7 @@ fn symbol(vehicle_type: VehicleType) -> Symbol {
 }
 
 fn color(vehicle_type: VehicleType) -> String {
-    let RGBColor(red, green, blue) = kind_color(Kind::Vehicle(vehicle_type));
-    format!("#{red:02x}{green:02x}{blue:02x}")
+    css_color(kind_color(Kind::Vehicle(vehicle_type)))
 }
 
 async fn vehicles(
@@ -152,7 +150,7 @@ async fn vehicles(
         .collect())
 }
 
-fn rounded(pixel: f64) -> f64 {
+pub(super) fn rounded(pixel: f64) -> f64 {
     (pixel * STEPS_PER_PIXEL).round() / STEPS_PER_PIXEL
 }
 
@@ -239,8 +237,7 @@ pub(super) async fn section(
             })
             .collect(),
     };
-    let hover =
-        serde_json::to_string(&hover)?.replace(SCRIPT_END_TAG_START, ESCAPED_SCRIPT_END_TAG_START);
+    let hover = script_json(&hover)?;
     let legend = legend(tr, selection, &vehicles);
     Ok(Some(html! {
         section #map {

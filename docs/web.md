@@ -37,7 +37,8 @@ once. The web page shares the database connection with the collector. It reads r
 An unknown `range` gives `400`, an unknown chart `404`. A period in any other form,
 like `/day/2026-9-27` or `/week/2026-W54`, gives `404`. Charts are drawn on the server
 with `plotters`. The overview pages (`/`, `/bus`, `/bus/136`, …) start with the [map
-of current vehicles](#map-of-current-vehicles). Then every page shows its charts,
+of current vehicles](#map-of-current-vehicles), the calendar pages with the [speed
+map](#speed-map). Then every page shows its charts,
 average speed first, and continues with the navigation links and the tables.
 
 The speed chart has two lines per vehicle type in the same color: a solid one for the
@@ -123,7 +124,8 @@ every fetch time.
 ## Calendar pages
 
 Days, weeks, months and years start at local midnight in the server's time zone, so a
-day can be 23 or 25 hours long when the clocks change. Each page shows one table with
+day can be 23 or 25 hours long when the clocks change. Each page shows the [speed
+map](#speed-map), one table with
 the totals of the period (a column per vehicle type with vehicles in it), the two
 charts over the whole period, links to the previous and next period, and links to the
 week, month and year it belongs to. A week belongs to the month and year of its
@@ -200,6 +202,36 @@ on it, or "No vehicles right now", and the OpenStreetMap attribution.
 `/tram/map.svg` or `/bus/136/map.svg`. Its `<image>` points to `/map/wroclaw.jpg` on the
 same server.
 
+## Speed map
+
+Above the charts, the calendar pages (day, week, month, year) show the same map of
+Wrocław split into hexagons of the [H3](https://h3geo.org) grid (the `h3o` crate,
+resolution 9: about 0.1 km² per hexagon, some 12 px wide on the map, so they follow
+the streets). Each hexagon is
+colored by the average speed of the page's vehicles (all vehicles, a vehicle type or a
+line) in the period, in fixed 5 km/h bands from "< 10" to "≥ 35" km/h, so maps of
+different periods can be compared. The colors are one blue from light (slow) to dark
+(fast), the sequential ramp of the palette used for the charts. The legend under the
+map shows the bands. Without the downloaded base map there is no speed map.
+
+- **Numbers:** the same steps as in [How the numbers are computed](#how-the-numbers-are-computed).
+  The time a vehicle stood at a position counts in the hexagon of that position. The
+  move to the next position (its distance and moving time) counts in the hexagon of
+  the point halfway between the two. So over the whole period the hexagons add up to
+  the page's average speed and average speed while moving. Only the distance at the
+  period's edges differs a little: the tables spread a step's distance over its whole
+  time, the map only over its moving time.
+- **Hidden hexagons:** a hexagon is shown only when the page's vehicles spent at least
+  5 minutes in it. With less, a single GPS jump can mean 300 km/h. The same limit
+  applies to each row of the hover.
+- **Hovering:** the page puts the SVG straight into the HTML, next to a JSON block
+  with the speeds of each shown hexagon. `src/speed_map_hover.js` outlines the hexagon
+  under the mouse and shows its average speed and average speed while moving, for all
+  vehicles and each vehicle type (or only the page's type or line). A tap works the
+  same on touch screens.
+
+The totals come from their own cache, see [Caching](#caching).
+
 ## Hovering the charts
 
 The page puts each chart's SVG straight into the HTML (an SVG loaded with `<img>`
@@ -262,13 +294,14 @@ All numbers are built from `vehicle_positions` rows (see
 
 ## Caching
 
-The server keeps totals in memory in two caches:
+The server keeps totals in memory in these caches:
 
 | Cache | Resolution | Keeps | Used by |
 |---|---|---|---|
 | Recent | 1 minute | the last 30 days, totals per vehicle type only | the overview |
 | Recent lines | 1 minute | the last day, also totals per line | the last hour and day of a line |
 | History | 15 minutes | everything, also totals per line: about 75 MB per year of data | calendar pages; the last week and month of a line |
+| Speed map | 1 local day | everything, totals per hexagon and line: about 240 KB per day, 90 MB per year of data | the speed map of calendar pages |
 
 Totals per line are what takes the memory: about 65 lines run at a time, and each
 keeps 32 bytes per bucket. To keep this small, a line's last week and last month come
@@ -277,10 +310,12 @@ all vehicles and vehicle types they start at the minute.
 
 A step can reach up to 11 minutes back, so a bucket is kept once it ended at least 12
 minutes ago; later buckets are computed again on each request. At start the server
-computes the last 30 days, the last day with lines, and then all history in the
-background, in 6-hour chunks. Each chunk is one query on the shared connection, so the
-collector waits at most for one chunk. A year of data takes a few minutes; until it is
-done, calendar pages and the last week and month of a line wait for it. Nothing is
+computes the last 30 days, the last day with lines, all history, and then the speed
+map of all days in the background, in 6-hour chunks. A day of the speed map is kept
+once it ended at least 12 minutes ago. Each chunk is one query on the shared connection, so the
+collector waits at most for one chunk. A year of data takes a few minutes for the
+history and a few more for the speed map; until they are done, calendar pages and the
+last week and month of a line wait for them. Nothing is
 stored in the database, so this happens after every restart.
 
 ## HTTP caching
@@ -305,7 +340,8 @@ shows only after the browser's copy expires.
 
 ## Tests
 
-- `src/stats.rs`, `src/charts.rs`, `src/map.rs`, `src/web.rs`, `src/web/selection.rs`:
+- `src/stats.rs`, `src/cells.rs`, `src/charts.rs`, `src/map.rs`, `src/web.rs`,
+  `src/web/selection.rs`, `src/web/speed_map.rs`:
   unit tests with small made-up data. The map tests use a blank base map instead of
   downloaded tiles.
 - `tests/live_backup.rs`: the overview's last-day values, a calendar day page and the
@@ -318,7 +354,7 @@ shows only after the browser's copy expires.
   moving the mouse over chart steps, using the arrow keys, going through the calendar
   pages, the data quality pages and their charts, and a browser set to Polish getting
   Polish pages. They start the server with the map disabled, so they don't download
-  tiles and don't cover the map's hover script. Chrome's languages are set for each test, so the system language
+  tiles and don't cover the hover scripts of the maps. Chrome's languages are set for each test, so the system language
   doesn't matter. They need
   Google Chrome. The matching chromedriver is downloaded on the first run; set
   `CHROMEDRIVER` (and `CHROME` for the browser) to use your own binaries instead, as

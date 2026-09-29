@@ -146,6 +146,10 @@ pub(super) enum Text {
     MapDescription,
     NoVehiclesNow,
     WhileMoving,
+    SpeedMap,
+    SpeedMapDescription,
+    Average,
+    SpeedKmh,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

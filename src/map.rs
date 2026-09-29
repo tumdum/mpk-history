@@ -188,12 +188,17 @@ impl Basemap {
 
     #[must_use]
     pub fn pixel(&self, latitude: MicroDegrees, longitude: MicroDegrees) -> Option<(f64, f64)> {
-        let (x, y) = world_pixel(latitude, longitude);
-        let x = x - f64::from(self.area.left);
-        let y = y - f64::from(self.area.top);
+        let (x, y) = self.unclipped_pixel(latitude, longitude);
         let inside = (0.0..f64::from(self.area.width)).contains(&x)
             && (0.0..f64::from(self.area.height)).contains(&y);
         inside.then_some((x, y))
+    }
+
+    /// Like [`Basemap::pixel`], but also for points outside the map.
+    #[must_use]
+    pub fn unclipped_pixel(&self, latitude: MicroDegrees, longitude: MicroDegrees) -> (f64, f64) {
+        let (x, y) = world_pixel(latitude, longitude);
+        (x - f64::from(self.area.left), y - f64::from(self.area.top))
     }
 }
 

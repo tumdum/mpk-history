@@ -8,6 +8,7 @@
 
 pub mod backup;
 pub mod build_info;
+pub mod cells;
 pub mod charts;
 pub mod collector;
 pub mod db;

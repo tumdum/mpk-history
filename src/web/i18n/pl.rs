@@ -115,6 +115,12 @@ impl Translation for Polish {
             }
             Text::NoVehiclesNow => "W tej chwili brak pojazdów",
             Text::WhileMoving => "W ruchu",
+            Text::SpeedMap => "Średnia prędkość według obszarów",
+            Text::SpeedMapDescription => {
+                "Mapa Wrocławia podzielona na sześciokąty, pokolorowane według średniej prędkości pojazdów w każdym z nich"
+            }
+            Text::Average => "Średnia",
+            Text::SpeedKmh => "Prędkość (km/h)",
         }
     }
 

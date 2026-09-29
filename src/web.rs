@@ -12,10 +12,11 @@ use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use jiff::{RoundMode, Timestamp, Unit, ZonedRound};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
+use crate::cells::{CellCache, CellSpeeds};
 use crate::charts::{self, Labels, LineChart, Point, RGBColor, Rendered, Series, Stroke, TickStep};
 use crate::db::{self, Db};
 use crate::mpk::VehicleType;
@@ -27,6 +28,7 @@ mod map;
 mod period;
 mod quality;
 mod selection;
+mod speed_map;
 
 use caching::{Caching, IfNoneMatch, Revision};
 use i18n::{ChartTime, Language, Neighbour, Relative, Text, Translation, capitalized};
@@ -45,6 +47,7 @@ const UPDATED_FORMAT: &str = "%Y-%m-%d %H:%M";
 const INTERNAL_ERROR: &str = "internal error";
 const CHART_SCRIPT: &str = include_str!("chart_hover.js");
 const MAP_SCRIPT: &str = include_str!("map_hover.js");
+const SPEED_MAP_SCRIPT: &str = include_str!("speed_map_hover.js");
 const GTAG_ID: &str = "G-ZCQG7QP403";
 const GTAG_SRC: &str = "https://www.googletagmanager.com/gtag/js";
 const GTAG_SCRIPT: &str = "
@@ -65,6 +68,7 @@ const STYLE: &str = r"
   --text-primary: #0b0b0b;
   --text-secondary: #52514e;
   --border: #e1e0d9;
+  --speed-cell-opacity: 0.55;
 }
 body {
   margin: 0 auto;
@@ -139,6 +143,15 @@ figcaption { color: var(--text-secondary); margin-top: 4px; }
 .map-empty, .map-attribution { margin: 0; }
 .map-attribution { font-size: 0.75rem; margin-top: 4px; }
 .map-attribution a { color: var(--text-secondary); }
+.speed-map { position: relative; }
+.speed-cells polygon { fill-opacity: var(--speed-cell-opacity); stroke: var(--surface); stroke-width: 1; }
+.speed-highlight { fill: none; stroke: var(--text-primary); stroke-width: 2.5; pointer-events: none; }
+.speed-legend-title { margin: 0 0 4px; }
+.speed-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; list-style: none; margin: 0; padding: 0; font-variant-numeric: tabular-nums; }
+.speed-legend li { display: flex; align-items: center; gap: 6px; }
+.speed-swatch { width: 14px; height: 14px; border-radius: 3px; opacity: var(--speed-cell-opacity); }
+.speed-tooltip-row { display: grid; grid-template-columns: 12px 1fr 4em 6em; gap: 8px; align-items: center; }
+.speed-tooltip-heading { color: var(--text-secondary); font-size: 0.75rem; text-align: right; }
 .breadcrumbs { color: var(--text-secondary); margin: 0 0 8px; }
 .breadcrumbs a, .subtitle a { color: var(--text-secondary); }
 .subtitle { color: var(--text-secondary); margin: 0; }
@@ -205,19 +218,23 @@ impl ChartStep {
         }
     }
 
-    fn starts(self, from_unix: i64, to_unix: i64, tz: &TimeZone) -> Vec<i64> {
+    fn next_start(self, start: i64, tz: &TimeZone) -> Option<i64> {
         let nominal_secs = self.nominal_secs();
+        let mut next = self.start_of(start + nominal_secs, tz);
+        if next <= start {
+            next = self.start_of(start + nominal_secs + nominal_secs / 2, tz);
+        }
+        (next > start).then_some(next)
+    }
+
+    fn starts(self, from_unix: i64, to_unix: i64, tz: &TimeZone) -> Vec<i64> {
         let mut starts = Vec::new();
         let mut start = self.start_of(from_unix, tz);
         while start < to_unix {
             starts.push(start);
-            let mut next = self.start_of(start + nominal_secs, tz);
-            if next <= start {
-                next = self.start_of(start + nominal_secs + nominal_secs / 2, tz);
-            }
-            if next <= start {
+            let Some(next) = self.next_start(start, tz) else {
                 break;
-            }
+            };
             start = next;
         }
         starts
@@ -475,6 +492,7 @@ struct AppState {
     recent: Arc<StatsCache>,
     recent_lines: Arc<StatsCache>,
     history: Arc<StatsCache>,
+    cells: Arc<CellCache>,
     clock: Clock,
     tz: TimeZone,
     revision: Revision,
@@ -500,6 +518,7 @@ impl AppState {
                 Retention::Forever,
                 Detail::Lines,
             )),
+            cells: Arc::default(),
             clock,
             tz: TimeZone::system(),
             revision: Revision::current(),
@@ -533,7 +552,17 @@ impl AppState {
                 elapsed_secs = started.elapsed().as_secs_f64(),
                 "statistics history ready"
             ),
-            Err(e) => warn!("failed to compute statistics history: {e:#}"),
+            Err(e) => {
+                warn!("failed to compute statistics history: {e:#}");
+                return;
+            }
+        }
+        match self.period_cells(i64::MIN, now_unix, now_unix, &[]).await {
+            Ok(_) => info!(
+                elapsed_secs = started.elapsed().as_secs_f64(),
+                "speed map history ready"
+            ),
+            Err(e) => warn!("failed to compute speed map history: {e:#}"),
         }
     }
 
@@ -653,6 +682,24 @@ impl AppState {
         self.history
             .totals(&self.db, from_unix, to_unix, now_unix, groups)
             .await
+    }
+
+    async fn period_cells(
+        &self,
+        from_unix: i64,
+        to_unix: i64,
+        now_unix: i64,
+        groups: &[Group],
+    ) -> Result<Vec<CellSpeeds>> {
+        let Some(first_unix) = self.db.first_seen_unix().await? else {
+            return Ok(Vec::new());
+        };
+        let days: Vec<(i64, i64)> = ChartStep::Days
+            .starts(from_unix.max(first_unix), to_unix.min(now_unix), &self.tz)
+            .into_iter()
+            .filter_map(|start| Some((start, ChartStep::Days.next_start(start, &self.tz)?)))
+            .collect();
+        self.cells.totals(&self.db, &days, now_unix, groups).await
     }
 
     fn today(&self) -> Date {
@@ -1045,17 +1092,13 @@ async fn overview(
     let chart = state.recent_range(&groups, selected, now_unix).await?;
     let shown = selection::shown(&subjects, &chart.series, |series| has_vehicles(series));
     let labels = ChartLabels::new(tr, selected.chart(), &state.tz);
-    let mut figures = Vec::with_capacity(Chart::ALL.len());
-    for chart_kind in Chart::ALL {
-        let rendered = render_chart(chart_kind, &shown, chart.window, &labels)?;
-        figures.push(chart_figure(
-            chart_kind.slug(),
-            tr.metric(chart_kind.metric()),
-            tr.range_caption(selected),
-            selected.slug(),
-            &rendered,
-        )?);
-    }
+    let figures = chart_figures(
+        &shown,
+        chart.window,
+        &labels,
+        tr.range_caption(selected),
+        selected.slug(),
+    )?;
     let map = map::section(&state, tr, &selection).await?;
     let (lines_from_unix, lines_to_unix) = Range::LONGEST.window(now_unix);
     let lines = state
@@ -1184,6 +1227,7 @@ fn shell(language: Language, caching: Caching, head: &Head, body: &Markup) -> Re
                 (body)
                 script { (PreEscaped(CHART_SCRIPT)) }
                 script { (PreEscaped(MAP_SCRIPT)) }
+                script { (PreEscaped(SPEED_MAP_SCRIPT)) }
             }
         }
     };
@@ -1235,17 +1279,9 @@ async fn period_page(
     let title = period.title(tr);
     let path = selection.period_path(period);
     let labels = ChartLabels::new(tr, period.chart(), &state.tz);
-    let mut figures = Vec::with_capacity(Chart::ALL.len());
-    for chart in Chart::ALL {
-        let rendered = render_chart(chart, &shown, (from_unix, to_unix), &labels)?;
-        figures.push(chart_figure(
-            chart.slug(),
-            tr.metric(chart.metric()),
-            &title,
-            &path,
-            &rendered,
-        )?);
-    }
+    let figures = chart_figures(&shown, (from_unix, to_unix), &labels, &title, &path)?;
+    let speed_map =
+        speed_map::section(&state, tr, &subjects, (from_unix, to_unix), now_unix).await?;
     let lines = state.db.lines_seen_between(from_unix, to_unix).await?;
     let page = Page::Period(period);
     let previous = period.previous()?;
@@ -1272,6 +1308,9 @@ async fn period_page(
             }
         }
         main {
+            @if let Some(speed_map) = &speed_map {
+                (speed_map)
+            }
             section #charts {
                 h2 { (tr.text(Text::Charts)) }
                 @for figure in &figures {
@@ -1311,6 +1350,28 @@ async fn period_page(
     Ok(shell(language, caching, &head, &body))
 }
 
+fn chart_figures(
+    shown: &[(&Subject, &Vec<TimedTotals>)],
+    window: (i64, i64),
+    labels: &ChartLabels,
+    caption: &str,
+    range: &str,
+) -> Result<Vec<Markup>> {
+    Chart::ALL
+        .into_iter()
+        .map(|chart| {
+            let rendered = render_chart(chart, shown, window, labels)?;
+            chart_figure(
+                chart.slug(),
+                labels.tr.metric(chart.metric()),
+                caption,
+                range,
+                &rendered,
+            )
+        })
+        .collect()
+}
+
 fn chart_figure(
     slug: &str,
     label: &str,
@@ -1318,8 +1379,7 @@ fn chart_figure(
     range: &str,
     rendered: &Rendered,
 ) -> Result<Markup> {
-    let hover = serde_json::to_string(&rendered.hover)?
-        .replace(SCRIPT_END_TAG_START, ESCAPED_SCRIPT_END_TAG_START);
+    let hover = script_json(&rendered.hover)?;
     Ok(html! {
         figure .chart #(format!("chart-{slug}")) data-range=(range) {
             div .chart-plot { (PreEscaped(&rendered.svg)) }
@@ -1328,6 +1388,15 @@ fn chart_figure(
             figcaption { (label) ", " (caption) }
         }
     })
+}
+
+fn css_color(RGBColor(red, green, blue): RGBColor) -> String {
+    format!("#{red:02x}{green:02x}{blue:02x}")
+}
+
+/// JSON that can stand inside a `<script>` element.
+fn script_json(value: &impl Serialize) -> Result<String> {
+    Ok(serde_json::to_string(value)?.replace(SCRIPT_END_TAG_START, ESCAPED_SCRIPT_END_TAG_START))
 }
 
 fn range_table(tr: &dyn Translation, subject: &Subject, rows: &[(Range, Totals)]) -> Markup {
@@ -3104,6 +3173,72 @@ mod tests {
             header_value(&basemap, header::CACHE_CONTROL),
             Some(SETTLED_CACHE_CONTROL)
         );
+    }
+
+    const STOP_SECS: i64 = 20 * 60;
+
+    async fn db_with_a_bus_and_a_long_tram_stop() -> Db {
+        let db = db_with_a_bus().await;
+        let tram = Position {
+            vehicle_type: VehicleType::Tram,
+            line: TRAM_LINE.to_owned(),
+            course_id: 2,
+            latitude: MicroDegrees(51_100_000),
+            longitude: MicroDegrees(17_000_000),
+        };
+        let mut unix = NOW - STOP_SECS;
+        while unix < NOW {
+            db.save_positions(unix, &[&tram], &[]).await.unwrap();
+            unix += FETCH_SECS;
+        }
+        db
+    }
+
+    fn speed_map_data(html: &str) -> serde_json::Value {
+        let [data] = &select_texts(html, "#speed-map .speed-map-data")[..] else {
+            panic!("expected speed map data");
+        };
+        serde_json::from_str(data).unwrap()
+    }
+
+    #[tokio::test]
+    async fn shows_the_average_speed_of_each_area_on_period_pages() {
+        let db = db_with_a_bus_and_a_long_tram_stop().await;
+        let day = containing_the_drive(PeriodKind::Day);
+        let html = get_with_map(&db, &day.path()).await.body;
+        assert_eq!(
+            select_attributes(&html, "main > section", "id")[..2],
+            ["speed-map", "charts"]
+        );
+        assert_eq!(
+            select_attributes(&html, "#speed-map svg polygon", "fill"),
+            [speed_map::slowest_color()]
+        );
+        let data = speed_map_data(&html);
+        let names: Vec<&str> = data["subjects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|subject| subject["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["All vehicles", "Trams"]);
+        assert_eq!(
+            data["cells"],
+            serde_json::json!([[["0.6", "36.0"], ["0.0", MISSING_VALUE]]])
+        );
+        assert_eq!(select_texts(&html, "#speed-map .speed-legend li").len(), 7);
+
+        let bus_line = get_with_map(&db, &format!("/bus/{BUS_LINE}{}", day.path()))
+            .await
+            .body;
+        assert!(select_texts(&bus_line, "#speed-map svg polygon").is_empty());
+        assert_eq!(
+            select_texts(&bus_line, "#speed-map .map-empty"),
+            [en().text(Text::NoData)]
+        );
+
+        let without_map = get(&db, &day.path()).await.body;
+        assert!(select_texts(&without_map, "#speed-map").is_empty());
     }
 
     #[tokio::test]

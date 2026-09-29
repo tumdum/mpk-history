@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.104"
 axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+h3o = "0.11.0"
 jiff = { version = "0.2.37", features = ["serde"] }
 jpeg-encoder = "0.7.1"
 maud = { version = "0.27.0", features = ["axum"] }

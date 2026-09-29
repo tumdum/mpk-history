@@ -42,6 +42,12 @@ impl Translation for English {
             Text::MapDescription => "Map of Wrocław with the vehicles seen in the last 30 seconds",
             Text::NoVehiclesNow => "No vehicles right now",
             Text::WhileMoving => "While moving",
+            Text::SpeedMap => "Average speed by area",
+            Text::SpeedMapDescription => {
+                "Map of Wrocław divided into hexagons, coloured by the average speed of the vehicles in each"
+            }
+            Text::Average => "Average",
+            Text::SpeedKmh => "Speed (km/h)",
         }
     }
 
