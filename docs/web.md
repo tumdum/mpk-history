@@ -31,6 +31,7 @@ once. The web page shares the database connection with the collector. It reads r
 | `/quality?range=…` | Data quality: failed downloads and invalid GPS positions |
 | `/day/2026-09-27/quality`, `/week/…/quality`, … | Data quality of one calendar period |
 | `/yesterday/quality`, `/prev_week/quality`, `/prev_month/quality` | Redirect to the data quality of the day, week or month before the current one |
+| `/about` | What the pages show, in plain words, without how the numbers are computed |
 | `/charts/average-speed.svg?range=…` | The average speed chart, with the speed while moving, as a plain SVG image |
 | `/charts/average-vehicles.svg?range=…` | The average active vehicles chart as a plain SVG image |
 | `/map.svg` | The map of current vehicles as a plain SVG image |
@@ -65,6 +66,18 @@ tritanopia, and at least 15 with normal vision). plotters' own palettes don't pa
 yellow and pink are too light on the white chart. Swapping a color means checking the
 whole set again. Every chart with two or more legend entries also has a legend, and
 hovering names each value, so color is never the only cue.
+
+## About page
+
+`/about` tells visitors what they can find on the pages: the map of current vehicles,
+the statistics and charts, vehicle types and lines, calendar pages, the speed map, data
+quality and languages. It leaves out how the numbers are computed on purpose; that
+stays in this document. The overview links to it with "About" next to "Data quality".
+Its text is one section per `AboutTopic` (`src/web/about.rs`), returned by
+`Translation::about`, so each language must write every section. A paragraph is a
+list of parts: plain words, or an address like `/yesterday` that the page turns into a
+link, so the translations don't hold any paths. It is kept for a minute, like live
+pages.
 
 ## Languages
 

@@ -1,11 +1,12 @@
 use jiff::Zoned;
 use jiff::civil::{Date, ISOWeekDate};
 
-use super::{ChartTime, Neighbour, Relative, Text, Translation};
+use super::{AboutPart, AboutText, ChartTime, Neighbour, Relative, Text, Translation};
 use crate::fetch::Source;
 use crate::mpk::VehicleType;
 use crate::stats::Kind;
-use crate::web::period::PeriodKind;
+use crate::web::about::AboutTopic;
+use crate::web::period::{PeriodKind, RecentPeriod};
 use crate::web::quality::QualityChart;
 use crate::web::{Metric, Range};
 
@@ -48,6 +49,10 @@ impl Translation for English {
             }
             Text::Average => "Average",
             Text::SpeedKmh => "Speed (km/h)",
+            Text::About => "About",
+            Text::AboutDescription => {
+                "What you can find on the MPK Wrocław statistics pages: a live map of vehicles, statistics, charts, calendar pages and data quality."
+            }
         }
     }
 
@@ -208,5 +213,81 @@ impl Translation for English {
             ChartTime::Month => "%b",
         };
         time.strftime(pattern).to_string()
+    }
+
+    fn about(&self, topic: AboutTopic) -> AboutText {
+        match topic {
+            AboutTopic::Service => AboutText {
+                heading: "What this is",
+                paragraphs: &[
+                    &[AboutPart::Words(
+                        "This site shows statistics of MPK Wrocław buses and trams: how fast they go, how many of them are on the road and how far they drive. It is built from the public vehicle positions published by MPK Wrocław, kept since the collecting started.",
+                    )],
+                    &[AboutPart::Words(
+                        "It is not an official MPK Wrocław service.",
+                    )],
+                ],
+            },
+            AboutTopic::CurrentVehicles => AboutText {
+                heading: "Vehicles now",
+                paragraphs: &[&[AboutPart::Words(
+                    "The overview starts with a map of Wrocław with every vehicle seen in the last 30 seconds. Buses, trams and trains each have their own shape and colour. Point at a vehicle, or tap it, to see its line and current speed.",
+                )]],
+            },
+            AboutTopic::Statistics => AboutText {
+                heading: "Statistics and charts",
+                paragraphs: &[
+                    &[AboutPart::Words(
+                        "The overview has tables for the last hour, day, week and month with the average speed, the average speed while moving, the average and peak number of active vehicles, and the distance driven. There is one table for all vehicles and one for each vehicle type.",
+                    )],
+                    &[AboutPart::Words(
+                        "The charts show how the average speed and the number of active vehicles changed over the chosen range. Point at a chart to see the values at that time. The charts also work with the keyboard.",
+                    )],
+                ],
+            },
+            AboutTopic::VehiclesAndLines => AboutText {
+                heading: "Vehicle types and lines",
+                paragraphs: &[&[AboutPart::Words(
+                    "Every page can be limited to buses, trams or a single line, with the links under the charts and the list of lines at the bottom of the page. A line's pages show the same statistics, charts and maps, for that line only.",
+                )]],
+            },
+            AboutTopic::CalendarPages => AboutText {
+                heading: "Days, weeks, months and years",
+                paragraphs: &[
+                    &[AboutPart::Words(
+                        "Every day, week, month and year has its own page with its totals and charts, links to the period before and after, and links to the days or months in it. The overview links to today, yesterday, this and the previous week and month, and this year.",
+                    )],
+                    &[
+                        AboutPart::Words("The addresses "),
+                        AboutPart::Address(RecentPeriod::Yesterday),
+                        AboutPart::Words(", "),
+                        AboutPart::Address(RecentPeriod::PreviousWeek),
+                        AboutPart::Words(" and "),
+                        AboutPart::Address(RecentPeriod::PreviousMonth),
+                        AboutPart::Words(
+                            " always lead to the day, week or month before the current one, so they work well as bookmarks.",
+                        ),
+                    ],
+                ],
+            },
+            AboutTopic::SpeedMap => AboutText {
+                heading: "Speed by area",
+                paragraphs: &[&[AboutPart::Words(
+                    "Calendar pages start with a map of the city split into small hexagons, coloured by how fast the vehicles went there in that period. Point at a hexagon to see its average speed, also for each vehicle type. The colours mean the same on every page, so different periods can be compared.",
+                )]],
+            },
+            AboutTopic::DataQuality => AboutText {
+                heading: "Data quality",
+                paragraphs: &[&[AboutPart::Words(
+                    "The data quality pages show how often downloading the data failed and what share of the GPS positions was invalid, for the same ranges and periods as the statistics. They help to tell whether an unusual number comes from the vehicles or from gaps in the data. Where there is no data at all, the pages show “–”.",
+                )]],
+            },
+            AboutTopic::Languages => AboutText {
+                heading: "Languages",
+                paragraphs: &[&[AboutPart::Words(
+                    "The pages are in English and Polish. The language follows the settings of your browser.",
+                )]],
+            },
+        }
     }
 }

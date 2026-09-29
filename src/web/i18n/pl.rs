@@ -1,11 +1,12 @@
 use jiff::Zoned;
 use jiff::civil::{Date, ISOWeekDate, Weekday};
 
-use super::{ChartTime, Neighbour, Relative, Text, Translation};
+use super::{AboutPart, AboutText, ChartTime, Neighbour, Relative, Text, Translation};
 use crate::fetch::Source;
 use crate::mpk::VehicleType;
 use crate::stats::Kind;
-use crate::web::period::PeriodKind;
+use crate::web::about::AboutTopic;
+use crate::web::period::{PeriodKind, RecentPeriod};
 use crate::web::quality::QualityChart;
 use crate::web::{Metric, Range};
 
@@ -121,6 +122,10 @@ impl Translation for Polish {
             }
             Text::Average => "Średnia",
             Text::SpeedKmh => "Prędkość (km/h)",
+            Text::About => "O stronie",
+            Text::AboutDescription => {
+                "Co można znaleźć na stronach statystyk MPK Wrocław: mapę pojazdów na żywo, statystyki, wykresy, strony kalendarzowe i jakość danych."
+            }
         }
     }
 
@@ -290,6 +295,82 @@ impl Translation for Polish {
             ),
             ChartTime::WeekdayDate => format!("{weekday} {}", time.strftime(DATE)),
             ChartTime::Month => month_name(&MONTHS_SHORT, time.date()).to_owned(),
+        }
+    }
+
+    fn about(&self, topic: AboutTopic) -> AboutText {
+        match topic {
+            AboutTopic::Service => AboutText {
+                heading: "Czym jest ta strona",
+                paragraphs: &[
+                    &[AboutPart::Words(
+                        "Ta strona pokazuje statystyki autobusów i tramwajów MPK Wrocław: jak szybko jeżdżą, ile ich jest na trasach i jaki dystans przejeżdżają. Powstaje z publicznych pozycji pojazdów udostępnianych przez MPK Wrocław, przechowywanych od początku zbierania.",
+                    )],
+                    &[AboutPart::Words(
+                        "To nie jest oficjalny serwis MPK Wrocław.",
+                    )],
+                ],
+            },
+            AboutTopic::CurrentVehicles => AboutText {
+                heading: "Pojazdy teraz",
+                paragraphs: &[&[AboutPart::Words(
+                    "Przegląd zaczyna się od mapy Wrocławia ze wszystkimi pojazdami widzianymi w ostatnich 30 sekundach. Autobusy, tramwaje i pociągi mają własny kształt i kolor. Najedź na pojazd albo go dotknij, aby zobaczyć jego linię i aktualną prędkość.",
+                )]],
+            },
+            AboutTopic::Statistics => AboutText {
+                heading: "Statystyki i wykresy",
+                paragraphs: &[
+                    &[AboutPart::Words(
+                        "Przegląd zawiera tabele dla ostatniej godziny, dnia, tygodnia i miesiąca ze średnią prędkością, średnią prędkością w ruchu, średnią i największą liczbą aktywnych pojazdów oraz przejechanym dystansem. Jest jedna tabela dla wszystkich pojazdów i osobna dla każdego rodzaju pojazdu.",
+                    )],
+                    &[AboutPart::Words(
+                        "Wykresy pokazują, jak zmieniały się średnia prędkość i liczba aktywnych pojazdów w wybranym zakresie. Najedź na wykres, aby zobaczyć wartości w danej chwili. Wykresy działają też z klawiatury.",
+                    )],
+                ],
+            },
+            AboutTopic::VehiclesAndLines => AboutText {
+                heading: "Rodzaje pojazdów i linie",
+                paragraphs: &[&[AboutPart::Words(
+                    "Każdą stronę można ograniczyć do autobusów, tramwajów albo jednej linii za pomocą odnośników pod wykresami i listy linii na dole strony. Strony linii pokazują te same statystyki, wykresy i mapy, ale tylko dla tej linii.",
+                )]],
+            },
+            AboutTopic::CalendarPages => AboutText {
+                heading: "Dni, tygodnie, miesiące i lata",
+                paragraphs: &[
+                    &[AboutPart::Words(
+                        "Każdy dzień, tydzień, miesiąc i rok ma własną stronę z podsumowaniem i wykresami, odnośnikami do okresu poprzedniego i następnego oraz do dni lub miesięcy, z których się składa. Przegląd ma odnośniki do dnia dzisiejszego i wczorajszego, bieżącego i poprzedniego tygodnia i miesiąca oraz bieżącego roku.",
+                    )],
+                    &[
+                        AboutPart::Words("Adresy "),
+                        AboutPart::Address(RecentPeriod::Yesterday),
+                        AboutPart::Words(", "),
+                        AboutPart::Address(RecentPeriod::PreviousWeek),
+                        AboutPart::Words(" i "),
+                        AboutPart::Address(RecentPeriod::PreviousMonth),
+                        AboutPart::Words(
+                            " zawsze prowadzą do dnia, tygodnia lub miesiąca przed bieżącym, więc dobrze nadają się na zakładki.",
+                        ),
+                    ],
+                ],
+            },
+            AboutTopic::SpeedMap => AboutText {
+                heading: "Prędkość według obszarów",
+                paragraphs: &[&[AboutPart::Words(
+                    "Strony kalendarzowe zaczynają się od mapy miasta podzielonej na małe sześciokąty, pokolorowane według tego, jak szybko jeździły tam pojazdy w danym okresie. Najedź na sześciokąt, aby zobaczyć jego średnią prędkość, także dla każdego rodzaju pojazdu. Kolory znaczą to samo na każdej stronie, więc można porównywać różne okresy.",
+                )]],
+            },
+            AboutTopic::DataQuality => AboutText {
+                heading: "Jakość danych",
+                paragraphs: &[&[AboutPart::Words(
+                    "Strony jakości danych pokazują, jak często nie udało się pobrać danych i jaka część pozycji GPS była błędna, dla tych samych zakresów i okresów co statystyki. Pomagają ocenić, czy nietypowa liczba wynika z ruchu pojazdów, czy z braków w danych. Tam, gdzie danych nie ma wcale, strony pokazują „–”.",
+                )]],
+            },
+            AboutTopic::Languages => AboutText {
+                heading: "Języki",
+                paragraphs: &[&[AboutPart::Words(
+                    "Strony są po angielsku i po polsku. Język wynika z ustawień przeglądarki.",
+                )]],
+            },
         }
     }
 }

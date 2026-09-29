@@ -7,7 +7,8 @@ use axum::http::request::Parts;
 use jiff::Zoned;
 use jiff::civil::{Date, ISOWeekDate};
 
-use super::period::PeriodKind;
+use super::about::AboutTopic;
+use super::period::{PeriodKind, RecentPeriod};
 use super::quality::QualityChart;
 use super::{Metric, Range};
 use crate::fetch::Source;
@@ -150,6 +151,18 @@ pub(super) enum Text {
     SpeedMapDescription,
     Average,
     SpeedKmh,
+    About,
+    AboutDescription,
+}
+
+pub(super) enum AboutPart {
+    Words(&'static str),
+    Address(RecentPeriod),
+}
+
+pub(super) struct AboutText {
+    pub(super) heading: &'static str,
+    pub(super) paragraphs: &'static [&'static [AboutPart]],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +215,7 @@ pub(super) trait Translation: Sync {
     fn week_short(&self, week: ISOWeekDate) -> String;
     fn month_short(&self, first_day: Date) -> String;
     fn chart_time(&self, time: &Zoned, format: ChartTime) -> String;
+    fn about(&self, topic: AboutTopic) -> AboutText;
 
     fn number(&self, value: f64, decimals: usize) -> String {
         let text = format!("{value:.decimals$}");

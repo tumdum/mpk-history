@@ -22,6 +22,7 @@ use crate::db::{self, Db};
 use crate::mpk::VehicleType;
 use crate::stats::{self, Detail, Group, Kind, Retention, StatsCache, TimedTotals, Totals};
 
+mod about;
 mod caching;
 mod i18n;
 mod map;
@@ -30,6 +31,7 @@ mod quality;
 mod selection;
 mod speed_map;
 
+use about::ABOUT_PATH;
 use caching::{Caching, IfNoneMatch, Revision};
 use i18n::{ChartTime, Language, Neighbour, Relative, Text, Translation, capitalized};
 pub use map::MapTiles;
@@ -156,6 +158,7 @@ figcaption { color: var(--text-secondary); margin-top: 4px; }
 .breadcrumbs a, .subtitle a { color: var(--text-secondary); }
 .subtitle { color: var(--text-secondary); margin: 0; }
 .period-nav { margin-top: 16px; }
+.about p { max-width: 70ch; line-height: 1.5; }
 ";
 
 const BLUE: RGBColor = RGBColor(0x2a, 0x78, 0xd6);
@@ -792,6 +795,7 @@ fn app(state: AppState) -> Router {
                 map::image(state, language, SelectionKey::All)
             }),
         )
+        .route(ABOUT_PATH, get(about::page))
         .route(
             BASEMAP_PATH,
             get(|State(state): State<AppState>| async move { map::basemap(&state) }),
@@ -1215,6 +1219,7 @@ async fn overview(
             }
             nav #pages aria-label=(tr.text(Text::Pages)) {
                 a #quality-link href=(selection.quality_path()) { (tr.text(Text::DataQuality)) }
+                a #about-link href=(ABOUT_PATH) { (tr.text(Text::About)) }
             }
             section #summary {
                 h2 { (tr.text(Text::Summary)) }
@@ -2218,6 +2223,7 @@ mod tests {
             (format!("/day/{day}"), Text::StatisticsDescription),
             ("/quality".to_owned(), Text::QualityDescription),
             (format!("/day/{day}/quality"), Text::QualityDescription),
+            (ABOUT_PATH.to_owned(), Text::AboutDescription),
         ] {
             let html = get(&db, &uri).await.body;
             let [heading] = &select_texts(&html, "h1")[..] else {
@@ -2228,6 +2234,38 @@ mod tests {
                 [format!("{heading}. {}", en().text(text))],
                 "{uri}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn about_page_describes_every_topic_in_the_language_of_the_browser() {
+        let db = empty_db().await;
+        let overview = get(&db, OVERVIEW_PATH).await.body;
+        assert_eq!(
+            select_attributes(&overview, "#about-link", "href"),
+            [ABOUT_PATH]
+        );
+        for language in [Language::English, Language::Polish] {
+            let tr = language.translation();
+            let fetched = get_in(&db, ABOUT_PATH, language.tag()).await;
+            assert_eq!(fetched.status, StatusCode::OK);
+            assert_eq!(
+                header_value(&fetched, header::CACHE_CONTROL),
+                Some(LIVE_CACHE_CONTROL)
+            );
+            assert_eq!(select_texts(&fetched.body, "h1"), [tr.text(Text::About)]);
+            assert_eq!(
+                select_texts(&fetched.body, "main section h2"),
+                about::AboutTopic::ALL.map(|topic| tr.about(topic).heading)
+            );
+            assert_eq!(
+                select_attributes(&fetched.body, "main section a", "href"),
+                ["/yesterday", "/prev_week", "/prev_month"]
+            );
+            for href in select_attributes(&fetched.body, "main a", "href") {
+                let status = get(&db, &href).await.status;
+                assert!(status.is_success() || status.is_redirection(), "{href}");
+            }
         }
     }
 
