@@ -202,6 +202,7 @@ impl TryFrom<CourseVehicleRow> for CourseVehicle {
 }
 
 pub enum PositionFilter<'a> {
+    All,
     Line(&'a str),
     Plate(&'a str),
 }
@@ -209,6 +210,7 @@ pub enum PositionFilter<'a> {
 impl PositionFilter<'_> {
     fn condition(&self) -> &'static str {
         match self {
+            PositionFilter::All => "TRUE",
             PositionFilter::Line(_) => "line_id IN (SELECT id FROM lines WHERE name = ?1)",
             PositionFilter::Plate(_) => {
                 "line_id IN (SELECT line_id FROM course_vehicles WHERE plate = ?1) \
@@ -217,9 +219,10 @@ impl PositionFilter<'_> {
         }
     }
 
-    fn value(&self) -> &str {
+    fn value(&self) -> Option<&str> {
         match self {
-            PositionFilter::Line(value) | PositionFilter::Plate(value) => value,
+            PositionFilter::All => None,
+            PositionFilter::Line(value) | PositionFilter::Plate(value) => Some(value),
         }
     }
 }
@@ -1309,6 +1312,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(summary(&trams), [(VehicleType::Tram, "1", 2, 100, 100)]);
+        let all = db
+            .positions_at(PositionFilter::All, 105, MAX_AGE)
+            .await
+            .unwrap();
+        assert_eq!(
+            summary(&all),
+            [
+                (VehicleType::Bus, "a", 1, 100, 105),
+                (VehicleType::Bus, "a", 3, 105, 105),
+                (VehicleType::Tram, "1", 2, 100, 100),
+            ]
+        );
         assert_eq!(line_count(&db).await, 2);
     }
 

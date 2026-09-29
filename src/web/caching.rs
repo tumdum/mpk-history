@@ -44,6 +44,13 @@ impl Caching {
         })
     }
 
+    pub(super) fn stable() -> Result<Self> {
+        Ok(Self {
+            cache_control: cache_control(SETTLED_MAX_AGE)?,
+            etag: None,
+        })
+    }
+
     pub(super) fn period(
         revision: Revision,
         language: Language,

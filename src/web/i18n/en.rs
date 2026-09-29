@@ -38,6 +38,9 @@ impl Translation for English {
             Text::FailedDownloads => "Failed downloads",
             Text::InvalidPositions => "Invalid GPS positions",
             Text::NoData => "No data",
+            Text::VehiclesNow => "Vehicles now",
+            Text::MapDescription => "Map of Wrocław with the vehicles seen in the last 30 seconds",
+            Text::NoVehiclesNow => "No vehicles right now",
         }
     }
 

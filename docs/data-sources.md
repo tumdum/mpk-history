@@ -1,7 +1,8 @@
 # External data sources
 
 `mpk-history collect` reads four external sources. Three loops run side by side:
-vehicle positions, weather and fleet data. This document describes how each source
+vehicle positions, weather and fleet data. The web page also downloads OpenStreetMap
+tiles once at start, for its map. This document describes how each source
 is read, what its data looks like, and how the sources are linked to each other.
 How the result is stored is described in [database.md](database.md).
 
@@ -11,6 +12,7 @@ How the result is stored is described in [database.md](database.md).
 | MPK positions | `https://mpk.wroc.pl/bus_position` | Live positions of vehicles | 10 s (`--interval-secs`) | `src/mpk.rs`, `src/collector.rs` |
 | Open-Meteo | `https://api.open-meteo.com/v1/forecast` | Weather on a grid over the city | 30 min (`--weather-interval-secs`) | `src/open_meteo.rs`, `src/weather.rs` |
 | Wrocław open data | `https://open-data.cui.wroclaw.pl/hdb/db/14?download=json` | Side number, plate and brigade of each vehicle | 15 min (`--fleet-interval-secs`) | `src/open_data.rs`, `src/fleet.rs`, `src/inference.rs` |
+| OpenStreetMap tiles | `https://tile.openstreetmap.org/12/{x}/{y}.png` | Map of the city for the web page | once at start (`--map`) | `src/map.rs`, `src/web/map.rs` |
 
 All HTTP requests share one client with a 30 s timeout (`src/fetch.rs`). A failed
 request is saved in the `fetch_errors` table with its URL, status, headers and the
@@ -202,6 +204,23 @@ Things to know about this data:
 - The page's metadata is wrong: it says the data is updated hourly and uses the title
   of the timetable dataset.
 - The "API link" shown on the page returns 404; the JSON download works.
+
+## OpenStreetMap tiles
+
+The map on the web page (see [web.md](web.md#map-of-current-vehicles)) is built from
+the standard OpenStreetMap tiles: 256×256 px PNG images in the Web Mercator
+projection. The area is fixed in `src/map.rs`: latitude 51.005–51.210 and longitude
+16.815–17.185, a little more than the bounding box of all stored positions. At zoom 12
+that is 5×5 = 25 tiles.
+
+- The tiles are downloaded one by one when the web page starts, with the shared
+  client and its `User-Agent`, as the [tile usage
+  policy](https://operations.osmfoundation.org/policies/tiles/) asks. They are not
+  saved to disk, so every restart downloads them again.
+- A failed download is only logged, not saved in `fetch_errors`, and all tiles are
+  downloaded again 15 minutes later.
+- The data is © OpenStreetMap contributors, under the ODbL. The page shows this
+  attribution with a link under the map.
 
 ## How the sources are linked
 

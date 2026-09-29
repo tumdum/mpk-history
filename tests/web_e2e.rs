@@ -10,7 +10,7 @@ use mpk_history::db::{self, Db, LinePositionCount, OpenMode};
 use mpk_history::fetch::{self, Source};
 use mpk_history::geo::MicroDegrees;
 use mpk_history::mpk::{Position, VehicleType};
-use mpk_history::web::{self, Clock};
+use mpk_history::web::{self, Clock, MapTiles};
 use serde::Deserialize;
 use tempfile::TempDir;
 use thirtyfour::common::capabilities::chromium::ChromiumLikeCapabilities;
@@ -79,7 +79,7 @@ impl TestServer {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (stop, stopped) = oneshot::channel();
         let clock = Clock::Fixed(Timestamp::from_second(NOW).unwrap());
-        let task = tokio::spawn(web::serve(listener, db, clock, async {
+        let task = tokio::spawn(web::serve(listener, db, clock, MapTiles::Disabled, async {
             stopped.await.ok();
         }));
         Self {

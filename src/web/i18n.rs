@@ -142,6 +142,9 @@ pub(super) enum Text {
     FailedDownloads,
     InvalidPositions,
     NoData,
+    VehiclesNow,
+    MapDescription,
+    NoVehiclesNow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

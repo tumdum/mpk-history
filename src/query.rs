@@ -1,13 +1,10 @@
-use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, civil};
 
-use crate::db::{
-    self, BoundingBox, Db, FleetVehicle, MatchSource, PathPoint, PositionFilter, StoredPosition,
-};
+use crate::db::{BoundingBox, Db, FleetVehicle, MatchSource, PositionFilter, StoredPosition};
 use crate::{open_data, speed};
 
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
@@ -16,7 +13,6 @@ const UNKNOWN_FLEET_VALUE: &str = "-";
 const FLEET_VALUE_SEPARATOR: &str = "/";
 const UNKNOWN_SPEED: &str = "-";
 const INFERRED_MARKER: &str = "*";
-pub const SPEED_WINDOW: Duration = Duration::from_secs(60);
 
 pub fn parse_time(input: &str) -> Result<Timestamp> {
     if let Ok(timestamp) = input.parse::<Timestamp>() {
@@ -60,7 +56,7 @@ pub async fn print_positions(
     );
     let course_ids: Vec<i64> = positions.iter().map(|p| p.course_id).collect();
     let fleet = db.fleet_vehicles(&course_ids).await?;
-    let speeds = speeds_kmh(db, &positions, at.as_second()).await?;
+    let speeds = speed::speeds_kmh(db, &positions, at.as_second()).await?;
     println!(
         "{:<5} {:<5} {:>10} {:>9} {:<9} {:<7} {:>6} {:>10} {:>10}  {:<19}  {:<19}",
         "TYPE",
@@ -87,39 +83,6 @@ pub async fn print_positions(
         println!("{INFERRED_MARKER} inferred from the brigade's previous or next course");
     }
     Ok(())
-}
-
-async fn speeds_kmh(
-    db: &Db,
-    positions: &[StoredPosition],
-    at_unix: i64,
-) -> Result<HashMap<(i64, i64), f64>> {
-    let mut vehicles_per_course: HashMap<(i64, i64), usize> = HashMap::new();
-    for position in positions {
-        *vehicles_per_course
-            .entry((position.line_id, position.course_id))
-            .or_default() += 1;
-    }
-    let courses: Vec<(i64, i64)> = vehicles_per_course
-        .iter()
-        .filter(|(_, vehicles)| **vehicles == 1)
-        .map(|(course, _)| *course)
-        .collect();
-    let window_start_unix = at_unix - db::duration_secs(SPEED_WINDOW);
-    let points = db.path_points(&courses, window_start_unix, at_unix).await?;
-    let mut paths: HashMap<(i64, i64), Vec<PathPoint>> = HashMap::new();
-    for point in points {
-        paths
-            .entry((point.line_id, point.course_id))
-            .or_default()
-            .push(point);
-    }
-    Ok(paths
-        .into_iter()
-        .filter_map(|(course, path)| {
-            speed::average_speed_kmh(&path, window_start_unix, at_unix).map(|speed| (course, speed))
-        })
-        .collect())
 }
 
 fn print_position(

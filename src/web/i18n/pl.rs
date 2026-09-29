@@ -109,6 +109,11 @@ impl Translation for Polish {
             Text::FailedDownloads => "Nieudane pobrania",
             Text::InvalidPositions => "Błędne pozycje GPS",
             Text::NoData => "Brak danych",
+            Text::VehiclesNow => "Pojazdy teraz",
+            Text::MapDescription => {
+                "Mapa Wrocławia z pojazdami widzianymi w ostatnich 30 sekundach"
+            }
+            Text::NoVehiclesNow => "W tej chwili brak pojazdów",
         }
     }
 

@@ -16,6 +16,7 @@ mod fetch_errors;
 pub mod fleet;
 pub mod geo;
 pub mod inference;
+pub mod map;
 pub mod mpk;
 pub mod open_data;
 pub mod open_meteo;

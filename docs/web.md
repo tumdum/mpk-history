@@ -11,6 +11,7 @@ mpk-history collect --listen 127.0.0.1:8080
 |---|---|---|---|
 | `--web` | `MPK_WEB` | `enabled` | `disabled` runs the collector only |
 | `--listen` | `MPK_LISTEN` | `127.0.0.1:8080` | Address of the web page |
+| `--map` | `MPK_MAP` | `enabled` | `disabled` doesn't download the map, so pages have no map |
 
 The address is bound before collecting starts, so a port in use stops `collect` at
 once. The web page shares the database connection with the collector. It reads rows in
@@ -30,11 +31,15 @@ once. The web page shares the database connection with the collector. It reads r
 | `/day/2026-09-27/quality`, `/week/…/quality`, … | Data quality of one calendar period |
 | `/charts/average-speed.svg?range=…` | The average speed chart as a plain SVG image |
 | `/charts/average-vehicles.svg?range=…` | The average active vehicles chart as a plain SVG image |
+| `/map.svg` | The map of current vehicles as a plain SVG image |
+| `/map/wroclaw.jpg` | The map of Wrocław without vehicles, used by `/map.svg` |
 
 An unknown `range` gives `400`, an unknown chart `404`. A period in any other form,
 like `/day/2026-9-27` or `/week/2026-W54`, gives `404`. Charts are drawn on the server
-with `plotters`. Every page starts with its charts, average speed first, then the
-navigation links and the tables.
+with `plotters`. Every page starts with its charts, average speed first. The overview
+pages (`/`, `/bus`, `/bus/136`, …) then show the [map of current
+vehicles](#map-of-current-vehicles), and all pages continue with the navigation links
+and the tables.
 
 Each page has a `<meta name="description">` for search engines: its heading followed by
 one translated sentence, one for statistics pages and one for data quality pages.
@@ -157,6 +162,37 @@ The numbers come from `fetch_attempts` and `position_counts` (see
 `0014`, and for lines from `line_position_counts`, filled since migration `0015`.
 Periods before that, or when a collector was disabled, show `–`.
 
+## Map of current vehicles
+
+Below the charts, the overview pages show a map of Wrocław with every vehicle seen in
+the last 30 seconds: buses as orange circles, trams as green squares and trains as
+violet triangles, in the colors of the charts. A vehicle type or line page shows only
+its own vehicles. Under the map is a legend with the number of vehicles of each type
+on it, or "No vehicles right now", and the OpenStreetMap attribution.
+
+- **Base map:** at start the server downloads the OpenStreetMap tiles of the city
+  (zoom 12, 25 tiles from `tile.openstreetmap.org`, see
+  [data-sources.md](data-sources.md#openstreetmap-tiles)), joins them into one image
+  (about 1080×950 px), fades it to light gray so that vehicles stand out, and keeps it
+  in memory as a JPEG (about 200 KB). It is served at `/map/wroclaw.jpg`. When the
+  download fails it is tried again every 15 minutes. Until it succeeds, pages have no
+  map and `/map.svg` and `/map/wroclaw.jpg` give `503`.
+- **Vehicles:** the latest row of each course that was last seen at most 30 s ago,
+  like `query --max-age-secs 30`. They are drawn as SVG shapes over the base map
+  image, so the map is sharp at any size.
+- **Speed:** each vehicle's speed over the last 60 s, computed like the `KM/H` column of
+  `query`: the straight-line distance between its positions over the time covered.
+  `–` means there is not enough data yet, for example right after it appeared.
+- **Hovering:** the page puts the SVG straight into the HTML, next to a JSON block with
+  each vehicle's pixel position, line, speed and color. `src/map_hover.js` finds the
+  vehicle nearest to the mouse (within 24 px), circles it and shows its line and speed.
+  A tap works the same on touch screens. The plain `/map.svg` has a `<title>` on each
+  vehicle instead, which browsers show as a tooltip.
+
+`/map.svg` takes the same vehicle type and line prefixes as the pages, like
+`/tram/map.svg` or `/bus/136/map.svg`. Its `<image>` points to `/map/wroclaw.jpg` on the
+same server.
+
 ## Hovering the charts
 
 The page puts each chart's SVG straight into the HTML (an SVG loaded with `<img>`
@@ -239,7 +275,8 @@ keep them:
 | Response | `Cache-Control` | `ETag` |
 |---|---|---|
 | Calendar and data quality pages of a period whose data is final | `max-age=86400` | `"<git commit>-<language>"` |
-| Everything else: overview, `?range=…`, `/quality`, chart images, periods not ended yet | `max-age=60` | none |
+| The base map, `/map/wroclaw.jpg` | `max-age=86400` | none |
+| Everything else: overview, `?range=…`, `/quality`, chart and map images, periods not ended yet | `max-age=60` | none |
 
 A period's data is final 12 minutes after it ends, like the finished buckets above.
 When a request's `If-None-Match` has the page's `ETag` (or `*`), the server answers
@@ -252,8 +289,9 @@ shows only after the browser's copy expires.
 
 ## Tests
 
-- `src/stats.rs`, `src/charts.rs`, `src/web.rs`, `src/web/selection.rs`: unit tests
-  with small made-up data.
+- `src/stats.rs`, `src/charts.rs`, `src/map.rs`, `src/web.rs`, `src/web/selection.rs`:
+  unit tests with small made-up data. The map tests use a blank base map instead of
+  downloaded tiles.
 - `tests/live_backup.rs`: the overview's last-day values, a calendar day page and the
   day page of the busiest line all match a separate scan of the test backup, the
   lines' totals add up to their vehicle type's, and a real `collect` run with MPK
@@ -263,7 +301,8 @@ shows only after the browser's copy expires.
 - `tests/web_e2e.rs`: end-to-end tests in headless Chrome with `thirtyfour`, including
   moving the mouse over chart steps, using the arrow keys, going through the calendar
   pages, the data quality pages and their charts, and a browser set to Polish getting
-  Polish pages. Chrome's languages are set for each test, so the system language
+  Polish pages. They start the server with the map disabled, so they don't download
+  tiles and don't cover the map's hover script. Chrome's languages are set for each test, so the system language
   doesn't matter. They need
   Google Chrome. The matching chromedriver is downloaded on the first run; set
   `CHROMEDRIVER` (and `CHROME` for the browser) to use your own binaries instead, as

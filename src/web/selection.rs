@@ -2,6 +2,7 @@ use anyhow::Result;
 use maud::{Markup, html};
 
 use super::i18n::{Text, Translation, capitalized};
+use super::map::MAP_PATH;
 use super::period::Period;
 use super::quality::{OVERVIEW_QUALITY_PATH, QUALITY_SEGMENT};
 use super::{OVERVIEW_PATH, Range, kind_color, kind_slug};
@@ -81,6 +82,18 @@ impl Selection {
 
     pub(super) fn period_quality_path(&self, period: Period) -> String {
         format!("{}/{QUALITY_SEGMENT}", self.period_path(period))
+    }
+
+    pub(super) fn map_path(&self) -> String {
+        format!("{}{MAP_PATH}", self.prefix())
+    }
+
+    pub(super) fn includes(&self, vehicle_type: VehicleType, line_id: i64) -> bool {
+        match self {
+            Selection::All => true,
+            Selection::Type(selected) => *selected == vehicle_type,
+            Selection::Line(line) => line.id == line_id,
+        }
     }
 
     pub(super) fn label(&self, tr: &dyn Translation) -> String {
@@ -335,6 +348,8 @@ mod tests {
             "/week/2026-W39/quality"
         );
         assert_eq!(Selection::All.range_path(Range::Hour), "/?range=hour");
+        assert_eq!(Selection::All.map_path(), "/map.svg");
+        assert_eq!(bus_line.map_path(), "/bus/136/map.svg");
         let odd = Selection::Line(line(VehicleType::Tram, "n 1/2"));
         assert_eq!(odd.overview_path(), "/tram/n%201%2F2");
     }

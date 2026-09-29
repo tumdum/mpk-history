@@ -16,9 +16,10 @@ use mpk_history::collector::VehicleCollector;
 use mpk_history::db::{Db, OpenMode};
 use mpk_history::fleet::FleetCollector;
 use mpk_history::inference::InferenceSettings;
+use mpk_history::map::TileClient;
 use mpk_history::open_meteo::Area;
 use mpk_history::weather::WeatherCollector;
-use mpk_history::web::Clock;
+use mpk_history::web::{Clock, MapTiles};
 use mpk_history::{backup, build_info, mpk, open_data, open_meteo, query, web};
 
 const DEFAULT_LOG_FILTER: &str = "info";
@@ -193,6 +194,10 @@ struct WebArgs {
     /// Address the web page listens on
     #[arg(long, env = "MPK_LISTEN", default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
+
+    /// Whether to download OpenStreetMap tiles at start for the map of current vehicles
+    #[arg(long, env = "MPK_MAP", value_enum, default_value_t = Mode::Enabled)]
+    map: Mode,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -336,7 +341,11 @@ async fn collect(
         let stopped = async move {
             stop.changed().await.ok();
         };
-        let result = web::serve(listener, db.clone(), Clock::System, stopped).await;
+        let tiles = match web_args.map {
+            Mode::Enabled => MapTiles::Download(TileClient::new(http.clone())),
+            Mode::Disabled => MapTiles::Disabled,
+        };
+        let result = web::serve(listener, db.clone(), Clock::System, tiles, stopped).await;
         if let Err(e) = &result {
             warn!("web page failed: {e:#}");
         }
@@ -407,7 +416,10 @@ mod tests {
         let web = web_args(&["mpk-history", "collect"]);
         assert!(matches!(web.web, Mode::Enabled));
         assert_eq!(web.listen, SocketAddr::from(([127, 0, 0, 1], 8080)));
+        assert!(matches!(web.map, Mode::Enabled));
         let web = web_args(&["mpk-history", "collect", "--web", "disabled"]);
         assert!(matches!(web.web, Mode::Disabled));
+        let web = web_args(&["mpk-history", "collect", "--map", "disabled"]);
+        assert!(matches!(web.map, Mode::Disabled));
     }
 }

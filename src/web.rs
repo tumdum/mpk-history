@@ -23,12 +23,15 @@ use crate::stats::{self, Detail, Group, Kind, Retention, StatsCache, TimedTotals
 
 mod caching;
 mod i18n;
+mod map;
 mod period;
 mod quality;
 mod selection;
 
 use caching::{Caching, IfNoneMatch, Revision};
 use i18n::{ChartTime, Language, Neighbour, Relative, Text, Translation, capitalized};
+pub use map::MapTiles;
+use map::{BASEMAP_PATH, MAP_PATH, SharedBasemap};
 use period::{Period, PeriodKind};
 use quality::{OVERVIEW_QUALITY_PATH, QUALITY_SEGMENT};
 use selection::{Page, Selection, SelectionKey, Subject};
@@ -41,6 +44,7 @@ const MISSING_VALUE: &str = "–";
 const UPDATED_FORMAT: &str = "%Y-%m-%d %H:%M";
 const INTERNAL_ERROR: &str = "internal error";
 const CHART_SCRIPT: &str = include_str!("chart_hover.js");
+const MAP_SCRIPT: &str = include_str!("map_hover.js");
 const GTAG_ID: &str = "G-ZCQG7QP403";
 const GTAG_SRC: &str = "https://www.googletagmanager.com/gtag/js";
 const GTAG_SCRIPT: &str = "
@@ -103,7 +107,7 @@ figure { margin: 0 0 24px; }
 .chart-plot svg:focus-visible { outline: 2px solid var(--text-primary); outline-offset: 2px; }
 .chart-crosshair { stroke: #c3c2b7; stroke-width: 1; }
 .chart-dot { stroke: var(--surface); stroke-width: 2; }
-.chart-tooltip {
+.chart-tooltip, .map-tooltip {
   position: absolute;
   pointer-events: none;
   min-width: 180px;
@@ -119,6 +123,22 @@ figure { margin: 0 0 24px; }
 .chart-tooltip-key { height: 2px; border-radius: 1px; }
 .chart-tooltip-value { font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; }
 figcaption { color: var(--text-secondary); margin-top: 4px; }
+.map { position: relative; }
+.map-plot svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  touch-action: pan-y;
+}
+.map-highlight { fill: none; stroke: var(--text-primary); stroke-width: 2; }
+.map-legend { display: flex; flex-wrap: wrap; gap: 16px; list-style: none; margin: 0; padding: 0; }
+.map-legend li { display: flex; align-items: center; gap: 6px; }
+.map-count { font-weight: 600; font-variant-numeric: tabular-nums; }
+.map-empty, .map-attribution { margin: 0; }
+.map-attribution { font-size: 0.75rem; margin-top: 4px; }
+.map-attribution a { color: var(--text-secondary); }
 .breadcrumbs { color: var(--text-secondary); margin: 0 0 8px; }
 .breadcrumbs a, .subtitle a { color: var(--text-secondary); }
 .subtitle { color: var(--text-secondary); margin: 0; }
@@ -430,6 +450,7 @@ struct AppState {
     clock: Clock,
     tz: TimeZone,
     revision: Revision,
+    basemap: SharedBasemap,
 }
 
 impl AppState {
@@ -454,6 +475,7 @@ impl AppState {
             clock,
             tz: TimeZone::system(),
             revision: Revision::current(),
+            basemap: SharedBasemap::default(),
         }
     }
 
@@ -660,6 +682,16 @@ fn app(state: AppState) -> Router {
                     chart(state, language, SelectionKey::All, file, query.range)
                 },
             ),
+        )
+        .route(
+            MAP_PATH,
+            get(|State(state): State<AppState>, language: Language| {
+                map::image(state, language, SelectionKey::All)
+            }),
+        )
+        .route(
+            BASEMAP_PATH,
+            get(|State(state): State<AppState>| async move { map::basemap(&state) }),
         );
     for kind in PeriodKind::ALL {
         router = router
@@ -808,7 +840,32 @@ fn vehicle_type_routes(
                 },
             ),
         );
+    router = vehicle_type_map_routes(router, vehicle_type);
     vehicle_type_period_routes(router, vehicle_type)
+}
+
+fn vehicle_type_map_routes(
+    router: Router<AppState>,
+    vehicle_type: VehicleType,
+) -> Router<AppState> {
+    let (type_path, line_path) = type_and_line_paths(vehicle_type);
+    router
+        .route(
+            &format!("{type_path}{MAP_PATH}"),
+            get(move |State(state): State<AppState>, language: Language| {
+                map::image(state, language, SelectionKey::Type(vehicle_type))
+            }),
+        )
+        .route(
+            &format!("{line_path}{MAP_PATH}"),
+            get(
+                move |State(state): State<AppState>,
+                      language: Language,
+                      Path(line): Path<String>| {
+                    map::image(state, language, SelectionKey::Line(vehicle_type, line))
+                },
+            ),
+        )
 }
 
 fn vehicle_type_period_routes(
@@ -898,10 +955,14 @@ pub async fn serve(
     listener: TcpListener,
     db: Db,
     clock: Clock,
+    tiles: MapTiles,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let state = AppState::new(db, clock);
     tokio::spawn(state.clone().warm_up());
+    if let MapTiles::Download(client) = tiles {
+        tokio::spawn(state.basemap.clone().download(client));
+    }
     axum::serve(listener, app(state))
         .with_graceful_shutdown(shutdown)
         .await?;
@@ -967,6 +1028,7 @@ async fn overview(
             &rendered,
         )?);
     }
+    let map = map::section(&state, tr, &selection).await?;
     let (lines_from_unix, lines_to_unix) = Range::LONGEST.window(now_unix);
     let lines = state
         .db
@@ -997,6 +1059,9 @@ async fn overview(
                 @for figure in &figures {
                     (figure)
                 }
+            }
+            @if let Some(map) = &map {
+                (map)
             }
             (selection::vehicles_nav(tr, &selection, page, &lines))
             nav #history aria-label=(tr.text(Text::History)) {
@@ -1090,6 +1155,7 @@ fn shell(language: Language, caching: Caching, head: &Head, body: &Markup) -> Re
             body {
                 (body)
                 script { (PreEscaped(CHART_SCRIPT)) }
+                script { (PreEscaped(MAP_SCRIPT)) }
             }
         }
     };
@@ -1414,6 +1480,7 @@ mod tests {
     use crate::db::{LinePositionCount, OpenMode};
     use crate::fetch::Source;
     use crate::geo::MicroDegrees;
+    use crate::map::Basemap;
     use crate::mpk::Position;
     use jiff::civil::Date;
 
@@ -1436,6 +1503,7 @@ mod tests {
         content_type: Option<String>,
         headers: header::HeaderMap,
         body: String,
+        bytes: Vec<u8>,
     }
 
     async fn empty_db() -> Db {
@@ -1497,12 +1565,13 @@ mod tests {
         let content_type = headers
             .get(header::CONTENT_TYPE)
             .map(|value| value.to_str().unwrap().to_owned());
-        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
         Fetched {
             status,
             content_type,
             headers,
-            body: String::from_utf8(body.to_vec()).unwrap(),
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+            bytes: bytes.to_vec(),
         }
     }
 
@@ -1839,6 +1908,7 @@ mod tests {
             format!("/bus/zzz{}", day.path()),
             format!("/bus/{BUS_LINE}/day/2027-13-01"),
             "/bus/zzz/charts/average-speed.svg".to_owned(),
+            "/bus/zzz/map.svg".to_owned(),
             format!("/bus/{BUS_LINE}/charts/distance.svg"),
             "/ship".to_owned(),
         ] {
@@ -2833,6 +2903,140 @@ mod tests {
                 Some(cache_control)
             );
             assert_eq!(header_value(&fetched, header::ETAG).is_some(), has_etag);
+        }
+    }
+
+    const JPEG_CONTENT_TYPE: &str = "image/jpeg";
+    const LATER_SECS: i64 = 3600;
+
+    fn app_with_map(db: &Db, now_unix: i64) -> Router {
+        let clock = Clock::Fixed(Timestamp::from_second(now_unix).unwrap());
+        app(AppState {
+            basemap: SharedBasemap::ready(Basemap::empty()),
+            ..AppState::new(db.clone(), clock)
+        })
+    }
+
+    async fn get_with_map(db: &Db, uri: &str) -> Fetched {
+        send_to(app_with_map(db, NOW), Request::get(uri)).await
+    }
+
+    fn map_vehicles(html: &str, field: &str) -> Vec<String> {
+        let [data] = &select_texts(html, "#map .map-data")[..] else {
+            panic!("expected map data");
+        };
+        let data: serde_json::Value = serde_json::from_str(data).unwrap();
+        data["vehicles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|vehicle| vehicle[field].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn shows_current_vehicles_on_a_map_below_the_charts() {
+        let db = db_with_a_bus_and_a_tram().await;
+        let html = get_with_map(&db, "/").await.body;
+        assert_eq!(
+            select_attributes(&html, "main > section", "id")[..2],
+            ["charts", "map"]
+        );
+        assert_eq!(
+            select_attributes(&html, "#map .map-plot svg g", "data-kind"),
+            ["bus", "tram"]
+        );
+        assert_eq!(
+            select_attributes(&html, "#map .map-plot svg image", "href"),
+            [BASEMAP_PATH]
+        );
+        assert!(select_texts(&html, "#map svg title").is_empty());
+        assert_eq!(map_vehicles(&html, "name"), ["Bus a", "Tram 1"]);
+        assert_eq!(map_vehicles(&html, "speed"), ["36 km/h", "0 km/h"]);
+        assert_eq!(
+            select_attributes(&html, "#map .map-legend li", "data-kind"),
+            ["bus", "tram"]
+        );
+        assert_eq!(select_texts(&html, "#map .map-count"), ["1", "1"]);
+        assert_eq!(
+            select_attributes(&html, "#map figure", "data-src"),
+            [MAP_PATH]
+        );
+
+        let line = get_with_map(&db, &format!("/bus/{BUS_LINE}")).await.body;
+        assert_eq!(map_vehicles(&line, "name"), [format!("Bus {BUS_LINE}")]);
+        assert_eq!(
+            select_texts(&line, "#map .map-legend li span:not(.map-count)"),
+            [format!("Bus {BUS_LINE}")]
+        );
+
+        let polish = send_to(
+            app_with_map(&db, NOW),
+            Request::get("/tram").header(header::ACCEPT_LANGUAGE, POLISH_BROWSER),
+        )
+        .await
+        .body;
+        assert_eq!(
+            map_vehicles(&polish, "name"),
+            [format!("Tramwaj {TRAM_LINE}")]
+        );
+    }
+
+    #[tokio::test]
+    async fn says_when_no_vehicles_are_running() {
+        let db = db_with_a_bus().await;
+        let html = send_to(app_with_map(&db, NOW + LATER_SECS), Request::get("/"))
+            .await
+            .body;
+        assert!(select_texts(&html, "#map .map-plot svg g").is_empty());
+        assert_eq!(
+            select_texts(&html, "#map .map-empty"),
+            [en().text(Text::NoVehiclesNow)]
+        );
+    }
+
+    #[tokio::test]
+    async fn serves_the_map_as_images() {
+        let db = db_with_a_bus_and_a_tram().await;
+        let map = get_with_map(&db, MAP_PATH).await;
+        assert_eq!(map.status, StatusCode::OK);
+        assert_eq!(map.content_type.as_deref(), Some(SVG_CONTENT_TYPE));
+        assert_eq!(
+            header_value(&map, header::CACHE_CONTROL),
+            Some(LIVE_CACHE_CONTROL)
+        );
+        assert_eq!(
+            select_texts(&map.body, "svg title"),
+            ["Bus a, 36 km/h", "Tram 1, 0 km/h"]
+        );
+        let trams = get_with_map(&db, &format!("/tram{MAP_PATH}")).await.body;
+        assert_eq!(select_attributes(&trams, "svg g", "data-kind"), ["tram"]);
+        let line = get_with_map(&db, &format!("/bus/{BUS_LINE}{MAP_PATH}"))
+            .await
+            .body;
+        assert_eq!(select_attributes(&line, "svg g", "data-kind"), ["bus"]);
+
+        let basemap = get_with_map(&db, BASEMAP_PATH).await;
+        assert_eq!(basemap.status, StatusCode::OK);
+        assert_eq!(basemap.content_type.as_deref(), Some(JPEG_CONTENT_TYPE));
+        assert_eq!(basemap.bytes, Basemap::empty().jpeg());
+        assert_eq!(
+            header_value(&basemap, header::CACHE_CONTROL),
+            Some(SETTLED_CACHE_CONTROL)
+        );
+    }
+
+    #[tokio::test]
+    async fn leaves_the_map_out_until_it_is_downloaded() {
+        let db = db_with_a_bus().await;
+        let html = get(&db, "/").await.body;
+        assert!(select_texts(&html, "#map").is_empty());
+        for uri in [MAP_PATH, BASEMAP_PATH] {
+            assert_eq!(
+                get(&db, uri).await.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{uri}"
+            );
         }
     }
 }

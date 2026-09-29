@@ -13,7 +13,7 @@ use mpk_history::db::{
 use mpk_history::geo::MicroDegrees;
 use mpk_history::inference::{self, InferenceSettings};
 use mpk_history::mpk::{Position, VehicleType};
-use mpk_history::{fleet, query, speed};
+use mpk_history::{fleet, speed};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;
@@ -93,7 +93,7 @@ impl Fixture {
 
     fn speed_window(&self) -> (i64, i64) {
         let end = self.sample.busy_unix;
-        (end - db::duration_secs(query::SPEED_WINDOW), end)
+        (end - db::duration_secs(speed::SPEED_WINDOW), end)
     }
 
     fn inference_window(&self) -> (i64, i64) {
