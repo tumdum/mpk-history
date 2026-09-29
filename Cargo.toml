@@ -32,6 +32,10 @@ tempfile = "3.27.0"
 thirtyfour = "0.37.5"
 tower = { version = "0.5.3", features = ["util"] }
 
+# Optimize the dependencie a little bit in the dev profile
+[profile.dev.package."*"]
+opt-level = 1
+
 [profile.release]
 opt-level = 3
 lto = true
