@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, IntoResponseParts, Response, ResponseParts};
 
 use super::i18n::Language;
 use super::language_headers;
+use super::page_cache::Validity;
 use crate::{build_info, db, stats};
 
 const SETTLED_MAX_AGE: Duration = Duration::from_hours(24);
@@ -34,6 +35,7 @@ impl Revision {
 pub(super) struct Caching {
     cache_control: HeaderValue,
     etag: Option<HeaderValue>,
+    pub(super) page_validity: Validity,
 }
 
 impl Caching {
@@ -41,6 +43,7 @@ impl Caching {
         Ok(Self {
             cache_control: cache_control(LIVE_MAX_AGE)?,
             etag: None,
+            page_validity: Validity::Recent,
         })
     }
 
@@ -48,6 +51,7 @@ impl Caching {
         Ok(Self {
             cache_control: cache_control(SETTLED_MAX_AGE)?,
             etag: None,
+            page_validity: Validity::Forever,
         })
     }
 
@@ -57,11 +61,13 @@ impl Caching {
         to_unix: i64,
         now_unix: i64,
     ) -> Result<Self> {
+        let mut caching = Self::live()?;
+        caching.page_validity = Validity::period(to_unix, now_unix);
         if now_unix < to_unix + db::duration_secs(stats::final_delay()) {
-            return Self::live();
+            return Ok(caching);
         }
         let Revision::Commit(commit) = revision else {
-            return Self::live();
+            return Ok(caching);
         };
         Ok(Self {
             cache_control: cache_control(SETTLED_MAX_AGE)?,
@@ -69,6 +75,7 @@ impl Caching {
                 "\"{commit}-{}\"",
                 language.tag()
             ))?),
+            page_validity: caching.page_validity,
         })
     }
 
@@ -116,7 +123,7 @@ impl IntoResponseParts for Caching {
 pub(super) struct IfNoneMatch(Vec<String>);
 
 impl IfNoneMatch {
-    fn matches(&self, etag: &str) -> bool {
+    pub(super) fn matches(&self, etag: &str) -> bool {
         self.0
             .iter()
             .flat_map(|value| value.split(TAG_SEPARATOR))

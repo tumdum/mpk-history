@@ -28,7 +28,7 @@ const NOT_ACCEPTABLE: f32 = 0.0;
 const FULL_QUALITY: f32 = 1.0;
 const DECIMAL_POINT: char = '.';
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Language {
     English,
     Polish,

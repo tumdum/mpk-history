@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -198,6 +199,9 @@ struct WebArgs {
     /// Whether to download OpenStreetMap tiles at start for the map of current vehicles
     #[arg(long, env = "MPK_MAP", value_enum, default_value_t = Mode::Enabled)]
     map: Mode,
+
+    #[arg(long, env = "MPK_PAGE_CACHE_CAPACITY", default_value_t = web::DEFAULT_PAGE_CACHE_CAPACITY, help = "Maximum number of rendered pages kept in memory")]
+    page_cache_capacity: NonZeroUsize,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -345,7 +349,15 @@ async fn collect(
             Mode::Enabled => MapTiles::Download(TileClient::new(http.clone())),
             Mode::Disabled => MapTiles::Disabled,
         };
-        let result = web::serve(listener, db.clone(), Clock::System, tiles, stopped).await;
+        let result = web::serve(
+            listener,
+            db.clone(),
+            Clock::System,
+            tiles,
+            web_args.page_cache_capacity,
+            stopped,
+        )
+        .await;
         if let Err(e) = &result {
             warn!("web page failed: {e:#}");
         }
@@ -417,9 +429,20 @@ mod tests {
         assert!(matches!(web.web, Mode::Enabled));
         assert_eq!(web.listen, SocketAddr::from(([127, 0, 0, 1], 8080)));
         assert!(matches!(web.map, Mode::Enabled));
+        assert_eq!(web.page_cache_capacity, web::DEFAULT_PAGE_CACHE_CAPACITY);
         let web = web_args(&["mpk-history", "collect", "--web", "disabled"]);
         assert!(matches!(web.web, Mode::Disabled));
         let web = web_args(&["mpk-history", "collect", "--map", "disabled"]);
         assert!(matches!(web.map, Mode::Disabled));
+    }
+
+    #[test]
+    fn page_cache_capacity_must_be_positive() {
+        let web = web_args(&["mpk-history", "collect", "--page-cache-capacity", "16"]);
+        assert_eq!(web.page_cache_capacity.get(), 16);
+        assert!(
+            Args::try_parse_from(["mpk-history", "collect", "--page-cache-capacity", "0",])
+                .is_err()
+        );
     }
 }

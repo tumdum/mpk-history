@@ -12,6 +12,7 @@ mpk-history collect --listen 127.0.0.1:8080
 | `--web` | `MPK_WEB` | `enabled` | `disabled` runs the collector only |
 | `--listen` | `MPK_LISTEN` | `127.0.0.1:8080` | Address of the web page |
 | `--map` | `MPK_MAP` | `enabled` | `disabled` doesn't download the map, so pages have no map |
+| `--page-cache-capacity` | `MPK_PAGE_CACHE_CAPACITY` | `128` | Maximum rendered HTML pages kept in memory; must be positive |
 
 The address is bound before collecting starts, so a port in use stops `collect` at
 once. The web page shares the database connection with the collector. It reads rows in
@@ -316,6 +317,19 @@ All numbers are built from `vehicle_positions` rows (see
 
 ## Caching
 
+Rendered HTML pages share an LRU cache, limited to 128 pages by default. Each URL
+(including its query) and language has its own entry. Pages are added only when
+requested, and only if the basemap was ready before rendering started. With map
+downloads disabled, rendered pages are not cached. Redirects, errors and standalone
+images are not stored in this cache.
+
+Overview and about pages expire after one minute. Calendar statistics and quality
+pages also expire after one minute until their period ended at least 24 hours ago;
+older pages have no expiry. Expired entries are removed when requested again, and
+the least recently used entry is evicted when the cache is full. No pages are
+prefilled or refreshed in the background. Restarting clears this cache, including
+historical pages if old data has been imported.
+
 The server keeps totals in memory in these caches:
 
 | Cache | Resolution | Keeps | Used by |
@@ -342,8 +356,7 @@ stored in the database, so this happens after every restart.
 
 ## HTTP caching
 
-Nothing is stored on the server, but the responses tell browsers how long they can
-keep them:
+Responses also tell browsers how long they can keep them:
 
 | Response | `Cache-Control` | `ETag` |
 |---|---|---|
@@ -358,7 +371,7 @@ When a request's `If-None-Match` has the page's `ETag` (or `*`), the server answ
 The `ETag` changes with each deploy, so new HTML is sent after it. A build from a dirty
 working copy (usual with jj) or without git information has no commit to go by, so it
 sends no `ETag` and every page gets `max-age=60`. Data imported for an old period later
-shows only after the browser's copy expires.
+shows only after both the rendered page cache and the browser's copy are refreshed.
 
 ## Tests
 

@@ -78,9 +78,16 @@ impl TestServer {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (stop, stopped) = oneshot::channel();
         let clock = Clock::Fixed(Timestamp::from_second(NOW).unwrap());
-        let task = tokio::spawn(web::serve(listener, db, clock, MapTiles::Disabled, async {
-            stopped.await.ok();
-        }));
+        let task = tokio::spawn(web::serve(
+            listener,
+            db,
+            clock,
+            MapTiles::Disabled,
+            web::DEFAULT_PAGE_CACHE_CAPACITY,
+            async {
+                stopped.await.ok();
+            },
+        ));
         Self {
             _dir: dir,
             url,

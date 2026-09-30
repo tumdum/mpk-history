@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,7 @@ mod about;
 mod caching;
 mod i18n;
 mod map;
+mod page_cache;
 mod period;
 mod quality;
 mod selection;
@@ -36,6 +38,8 @@ use caching::{Caching, IfNoneMatch, Revision};
 use i18n::{ChartTime, Language, Neighbour, Relative, Text, Translation, capitalized};
 pub use map::MapTiles;
 use map::{BASEMAP_PATH, MAP_PATH, SharedBasemap};
+pub use page_cache::DEFAULT_PAGE_CACHE_CAPACITY;
+use page_cache::PageCache;
 use period::{Period, PeriodKind, RecentPeriod};
 use quality::{OVERVIEW_QUALITY_PATH, QUALITY_SEGMENT};
 use selection::{Page, Selection, SelectionKey, Subject};
@@ -500,6 +504,7 @@ struct AppState {
     tz: TimeZone,
     revision: Revision,
     basemap: SharedBasemap,
+    pages: Arc<PageCache>,
 }
 
 impl AppState {
@@ -526,6 +531,7 @@ impl AppState {
             tz: crate::time::warsaw(),
             revision: Revision::current(),
             basemap: SharedBasemap::default(),
+            pages: Arc::new(PageCache::new(DEFAULT_PAGE_CACHE_CAPACITY)),
         }
     }
 
@@ -756,8 +762,8 @@ fn recent_period_route(prefix: &str, recent: RecentPeriod, view: PeriodView) -> 
     view.route(&format!("{prefix}/{}", recent.slug()))
 }
 
-fn app(state: AppState) -> Router {
-    let mut router = Router::new()
+fn root_routes() -> Router<AppState> {
+    Router::new()
         .route(
             OVERVIEW_PATH,
             get(
@@ -799,7 +805,11 @@ fn app(state: AppState) -> Router {
         .route(
             BASEMAP_PATH,
             get(|State(state): State<AppState>| async move { map::basemap(&state) }),
-        );
+        )
+}
+
+fn app(state: AppState) -> Router {
+    let mut router = root_routes();
     for kind in PeriodKind::ALL {
         router = router
             .route(
@@ -853,7 +863,12 @@ fn app(state: AppState) -> Router {
         router = vehicle_type_routes(router, vehicle_type);
         router = vehicle_type_recent_period_routes(router, vehicle_type);
     }
-    router.with_state(state)
+    router
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            page_cache::serve,
+        ))
+        .with_state(state)
 }
 
 fn vehicle_type_routes(
@@ -1106,9 +1121,13 @@ pub async fn serve(
     db: Db,
     clock: Clock,
     tiles: MapTiles,
+    page_cache_capacity: NonZeroUsize,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
-    let state = AppState::new(db, clock);
+    let state = AppState {
+        pages: Arc::new(PageCache::new(page_cache_capacity)),
+        ..AppState::new(db, clock)
+    };
     tokio::spawn(state.clone().warm_up());
     if let MapTiles::Download(client) = tiles {
         tokio::spawn(state.basemap.clone().download(client));
@@ -1307,7 +1326,10 @@ fn shell(language: Language, caching: Caching, head: &Head, body: &Markup) -> Re
             }
         }
     };
-    (language_headers(language), caching, markup).into_response()
+    let validity = caching.page_validity;
+    let mut response = (language_headers(language), caching, markup).into_response();
+    response.extensions_mut().insert(validity);
+    response
 }
 
 fn language_headers(language: Language) -> [(header::HeaderName, HeaderValue); 2] {
