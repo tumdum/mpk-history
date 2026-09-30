@@ -24,5 +24,6 @@ pub mod open_meteo;
 pub mod query;
 pub mod speed;
 pub mod stats;
+pub mod time;
 pub mod weather;
 pub mod web;

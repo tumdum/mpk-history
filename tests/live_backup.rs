@@ -10,7 +10,6 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use jiff::civil;
-use jiff::tz::TimeZone;
 use jiff::{RoundMode, Timestamp, Unit, ZonedRound};
 use mpk_history::db::{Db, OpenMode};
 use mpk_history::mpk::VehicleType;
@@ -29,7 +28,6 @@ const COMPRESSED_BACKUP: &str = concat!(
 const BINARY: &str = env!("CARGO_BIN_EXE_mpk-history");
 const DATABASE_FILE: &str = "mpk-history.sqlite";
 const BACKUP_COPY_FILE: &str = "copy.sqlite";
-const TIME_ZONE: &str = "Europe/Warsaw";
 const LOG_FILTER: &str = "error";
 const MIGRATIONS_TABLE: &str = "_sqlx_migrations";
 const INTEGRITY_OK: &str = "ok";
@@ -150,7 +148,7 @@ fn run(database: &Path, args: &[&str]) -> Output {
         .arg("--database")
         .arg(database)
         .args(args)
-        .env("TZ", TIME_ZONE)
+        .env("TZ", mpk_history::time::WARSAW_TIME_ZONE_NAME)
         .env("RUST_LOG", LOG_FILTER)
         .output()
         .unwrap()
@@ -274,7 +272,7 @@ impl ShownVehicle {
 
 fn parse_local_time(date: &str, time: &str) -> i64 {
     let local: civil::DateTime = format!("{date} {time}").parse().unwrap();
-    let time_zone = TimeZone::get(TIME_ZONE).unwrap();
+    let time_zone = mpk_history::time::warsaw();
     local.to_zoned(time_zone).unwrap().timestamp().as_second()
 }
 
@@ -539,7 +537,7 @@ async fn query_accepts_local_time_and_upper_case_line_names() {
     .unwrap();
     let local = Timestamp::from_second(at_unix)
         .unwrap()
-        .to_zoned(TimeZone::get(TIME_ZONE).unwrap())
+        .to_zoned(mpk_history::time::warsaw())
         .strftime("%Y-%m-%d %H:%M:%S")
         .to_string();
 
@@ -1163,7 +1161,7 @@ impl ScannedStats {
 fn local_hour(unix: i64) -> i64 {
     Timestamp::from_second(unix)
         .unwrap()
-        .to_zoned(TimeZone::system())
+        .to_zoned(mpk_history::time::warsaw())
         .round(
             ZonedRound::new()
                 .smallest(Unit::Hour)
@@ -1442,7 +1440,7 @@ async fn calendar_day_page_matches_a_scan_of_that_day() {
 }
 
 fn backup_full_day_window() -> (civil::Date, (i64, i64)) {
-    let tz = TimeZone::system();
+    let tz = mpk_history::time::warsaw();
     let day = civil::date(BACKUP_FULL_DAY.0, BACKUP_FULL_DAY.1, BACKUP_FULL_DAY.2);
     let start = |date: civil::Date| date.to_zoned(tz.clone()).unwrap().timestamp().as_second();
     (day, (start(day), start(day.tomorrow().unwrap())))
@@ -1587,7 +1585,7 @@ fn collect(database: &Path, web: &str, address: &str, dead_proxy: &str) -> Runni
         .arg(database)
         .args(["collect", "--web", web, "--listen", address])
         .args(["--weather", "disabled", "--fleet", "disabled"])
-        .env("TZ", TIME_ZONE)
+        .env("TZ", mpk_history::time::WARSAW_TIME_ZONE_NAME)
         .env("RUST_LOG", LOG_FILTER)
         .env("HTTP_PROXY", dead_proxy)
         .env("HTTPS_PROXY", dead_proxy)

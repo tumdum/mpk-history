@@ -277,12 +277,9 @@ mod tests {
     use super::*;
     use crate::web::i18n::Language;
 
-    const WARSAW: &str = "Europe/Warsaw";
     const HOUR_SECS: i64 = 60 * 60;
 
-    fn warsaw() -> TimeZone {
-        TimeZone::get(WARSAW).unwrap()
-    }
+    use crate::time::warsaw;
 
     fn period(kind: PeriodKind, text: &str) -> Period {
         Period::parse(kind, text).unwrap_or_else(|| panic!("{text} is not a {kind:?}"))

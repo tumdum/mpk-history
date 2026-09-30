@@ -523,7 +523,7 @@ impl AppState {
             )),
             cells: Arc::default(),
             clock,
-            tz: TimeZone::system(),
+            tz: crate::time::warsaw(),
             revision: Revision::current(),
             basemap: SharedBasemap::default(),
         }
@@ -1662,6 +1662,7 @@ fn render_chart(
         to_unix,
         y_label: labels.tr.metric(chart.metric()),
         labels,
+        tz: labels.tz.clone(),
         tick_step: labels.spec.tick_step,
         series,
         dashed_legend: chart
@@ -1753,6 +1754,40 @@ mod tests {
             revision,
             ..AppState::new(db.clone(), clock)
         })
+    }
+
+    #[tokio::test]
+    async fn ui_uses_warsaw_time_in_winter_and_summer() {
+        let db = empty_db().await;
+        for (utc, local, date) in [
+            (
+                "2026-01-15T23:30:00Z",
+                "2026-01-16 00:30",
+                Date::new(2026, 1, 16).unwrap(),
+            ),
+            (
+                "2026-07-15T22:30:00Z",
+                "2026-07-16 00:30",
+                Date::new(2026, 7, 16).unwrap(),
+            ),
+        ] {
+            let now: Timestamp = utc.parse().unwrap();
+            let state = AppState::new(db.clone(), Clock::Fixed(now));
+            assert_eq!(state.today(), date);
+            let labels = ChartLabels::new(
+                Language::English.translation(),
+                Range::Hour.chart(),
+                &state.tz,
+            );
+            assert_eq!(labels.tick(now.as_second()), "00:30");
+            assert!(labels.hover(now.as_second()).contains("00:30"));
+            let fetched = send_to(app(state), Request::get("/")).await;
+            assert_eq!(select_texts(&fetched.body, "#updated time"), [local]);
+            assert_eq!(
+                select_attributes(&fetched.body, "#updated time", "datetime"),
+                [now.to_string()]
+            );
+        }
     }
 
     async fn send(db: &Db, request: axum::http::request::Builder) -> Fetched {
@@ -2065,7 +2100,7 @@ mod tests {
     #[tokio::test]
     async fn line_averages_skip_hours_without_its_vehicles() {
         let db = empty_db().await;
-        let tz = TimeZone::system();
+        let tz = crate::time::warsaw();
         let day = local_date(NOW).yesterday().unwrap();
         let at = |hour| {
             day.at(hour, 0, 0, 0)
@@ -2322,7 +2357,7 @@ mod tests {
             .collect();
         assert_eq!(strokes, ["solid", "dashed", "solid", "dashed"]);
         let steps = speed["steps"].as_array().unwrap();
-        let offset_secs = TimeZone::system()
+        let offset_secs = crate::time::warsaw()
             .to_offset(Timestamp::from_second(NOW).unwrap())
             .seconds();
         let partial_hours = usize::from(offset_secs % HOUR_SECS != 0);
@@ -2424,7 +2459,7 @@ mod tests {
     fn local_date(unix: i64) -> Date {
         Timestamp::from_second(unix)
             .unwrap()
-            .to_zoned(TimeZone::system())
+            .to_zoned(crate::time::warsaw())
             .date()
     }
 
@@ -2437,7 +2472,7 @@ mod tests {
     }
 
     fn contains_now(period: Period) -> bool {
-        let (from, to) = period.bounds(&TimeZone::system()).unwrap();
+        let (from, to) = period.bounds(&crate::time::warsaw()).unwrap();
         (from.as_second()..to.as_second()).contains(&NOW)
     }
 
@@ -2937,7 +2972,7 @@ mod tests {
 
     #[test]
     fn lists_chart_steps_in_local_time() {
-        let tz = TimeZone::get("Europe/Warsaw").unwrap();
+        let tz = crate::time::warsaw();
         let start = |year, month, day| {
             jiff::civil::date(year, month, day)
                 .to_zoned(tz.clone())
@@ -3194,7 +3229,7 @@ mod tests {
     async fn periods_are_kept_only_once_their_data_is_final() {
         let db = db_with_a_bus().await;
         let day = containing_the_drive(PeriodKind::Day);
-        let (_, to) = day.bounds(&TimeZone::system()).unwrap();
+        let (_, to) = day.bounds(&crate::time::warsaw()).unwrap();
         let final_unix = to.as_second() + db::duration_secs(stats::final_delay());
         let at =
             |now_unix, revision| send_to(app_at(&db, now_unix, revision), Request::get(day.path()));

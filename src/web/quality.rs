@@ -328,6 +328,7 @@ fn render_share_chart(
         to_unix,
         y_label: label,
         labels,
+        tz: labels.tz.clone(),
         tick_step: labels.spec.tick_step,
         series,
         dashed_legend: None,

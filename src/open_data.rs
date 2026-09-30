@@ -6,9 +6,9 @@ use tracing::warn;
 
 use crate::fetch::{self, FetchError, Source};
 use crate::geo::{self, MicroDegrees};
+use crate::time::WARSAW_TIME_ZONE_NAME;
 
 const VEHICLES_URL: &str = "https://open-data.cui.wroclaw.pl/hdb/db/14?download=json";
-const TIME_ZONE: &str = "Europe/Warsaw";
 const MISSING_PLATE: &str = "-";
 const MISSING_SIDE_NUMBER: i64 = 0;
 
@@ -62,8 +62,8 @@ pub struct Client {
 
 impl Client {
     pub fn new(http: reqwest::Client) -> Result<Self> {
-        let time_zone = TimeZone::get(TIME_ZONE)
-            .with_context(|| format!("time zone {TIME_ZONE} is not available"))?;
+        let time_zone = TimeZone::get(WARSAW_TIME_ZONE_NAME)
+            .with_context(|| format!("time zone {WARSAW_TIME_ZONE_NAME} is not available"))?;
         Ok(Self { http, time_zone })
     }
 

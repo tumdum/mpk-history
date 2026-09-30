@@ -103,6 +103,7 @@ pub struct LineChart<'a> {
     pub to_unix: i64,
     pub y_label: &'a str,
     pub labels: &'a dyn Labels,
+    pub tz: TimeZone,
     pub tick_step: TickStep,
     pub series: Vec<Series>,
     /// The one legend entry for all dashed series; dashed series get no entry of their own.
@@ -179,7 +180,7 @@ fn draw(root: &DrawingArea<SVGBackend, Shift>, chart: &LineChart) -> Result<Hove
         .filter(|max| *max > 0.0)
         .map_or(EMPTY_Y_MAX, |max| max * headroom(legend_entries));
     let label_style = (FONT, FONT_SIZE).into_font().color(&TEXT_SECONDARY);
-    let ticks = time_ticks(chart.from_unix, chart.to_unix, chart.tick_step)?;
+    let ticks = time_ticks(chart.from_unix, chart.to_unix, chart.tick_step, &chart.tz)?;
     let tick_count = ticks.len();
     let mut plot = ChartBuilder::on(root)
         .margin(MARGIN)
@@ -383,8 +384,8 @@ fn runs(points: &[Point]) -> Vec<Vec<(i64, f64)>> {
     runs
 }
 
-fn time_ticks(from_unix: i64, to_unix: i64, step: TickStep) -> Result<Vec<i64>> {
-    let start = Timestamp::from_second(from_unix)?.to_zoned(TimeZone::system());
+fn time_ticks(from_unix: i64, to_unix: i64, step: TickStep, tz: &TimeZone) -> Result<Vec<i64>> {
+    let start = Timestamp::from_second(from_unix)?.to_zoned(tz.clone());
     let mut tick = start.round(step.rounding())?;
     if let TickStep::Months(_) = step {
         let month_start = start.first_of_month()?.start_of_day()?;
@@ -440,7 +441,7 @@ mod tests {
             |_| String::new(),
             |timestamp| {
                 timestamp
-                    .to_zoned(TimeZone::system())
+                    .to_zoned(TimeZone::UTC)
                     .strftime(format)
                     .to_string()
             },
@@ -453,6 +454,7 @@ mod tests {
             to_unix: 600,
             y_label: "km/h",
             labels: &TestLabels,
+            tz: TimeZone::UTC,
             tick_step: TickStep::Minutes(TICK_MINUTES),
             series,
             dashed_legend: None,
@@ -517,22 +519,29 @@ mod tests {
     #[test]
     fn puts_ticks_on_round_times() {
         let from_unix = 7 * MINUTE_SECS + 5;
-        let ticks = time_ticks(from_unix, from_unix + HOUR_SECS, TickStep::Minutes(10)).unwrap();
+        let ticks = time_ticks(
+            from_unix,
+            from_unix + HOUR_SECS,
+            TickStep::Minutes(10),
+            &TimeZone::UTC,
+        )
+        .unwrap();
         assert_eq!(
             ticks,
             [10, 20, 30, 40, 50, 60].map(|minutes| minutes * MINUTE_SECS)
         );
-        let exact = time_ticks(0, 2 * MINUTE_SECS, TickStep::Minutes(1)).unwrap();
+        let exact = time_ticks(0, 2 * MINUTE_SECS, TickStep::Minutes(1), &TimeZone::UTC).unwrap();
         assert_eq!(exact, [0, MINUTE_SECS]);
 
         let year_start = jiff::civil::date(2026, 1, 1)
-            .to_zoned(TimeZone::system())
+            .to_zoned(TimeZone::UTC)
             .unwrap();
         let year_end = year_start.checked_add(Span::new().years(1)).unwrap();
         let months = time_ticks(
             year_start.timestamp().as_second() + 1,
             year_end.timestamp().as_second(),
             TickStep::Months(1),
+            &TimeZone::UTC,
         )
         .unwrap();
         let labels: Vec<String> = months
@@ -542,6 +551,31 @@ mod tests {
         assert_eq!(labels.len(), 11);
         assert_eq!(labels[0], "02-01 00");
         assert_eq!(labels[10], "12-01 00");
+    }
+
+    #[test]
+    fn warsaw_daily_ticks_follow_daylight_saving_transitions() {
+        let tz = crate::time::warsaw();
+        for (from, to, hours) in [
+            ("2026-03-28T23:00:00Z", "2026-03-30T22:00:00Z", 23),
+            ("2026-10-24T22:00:00Z", "2026-10-26T23:00:00Z", 25),
+        ] {
+            let from: Timestamp = from.parse().unwrap();
+            let to: Timestamp = to.parse().unwrap();
+            let ticks =
+                time_ticks(from.as_second(), to.as_second(), TickStep::Days(1), &tz).unwrap();
+            assert_eq!(ticks.len(), 2);
+            assert_eq!(ticks[1] - ticks[0], hours * HOUR_SECS);
+            for tick in ticks {
+                assert_eq!(
+                    Timestamp::from_second(tick)
+                        .unwrap()
+                        .to_zoned(tz.clone())
+                        .time(),
+                    jiff::civil::Time::midnight()
+                );
+            }
+        }
     }
 
     #[test]

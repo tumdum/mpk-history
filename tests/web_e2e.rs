@@ -4,7 +4,6 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
-use jiff::tz::TimeZone;
 use jiff::{RoundMode, Timestamp, Unit, Zoned, ZonedRound};
 use mpk_history::db::{self, Db, LinePositionCount, OpenMode};
 use mpk_history::fetch::{self, Source};
@@ -328,7 +327,7 @@ async fn step_position(
 fn hour_label(unix: i64) -> String {
     Timestamp::from_second(unix)
         .unwrap()
-        .to_zoned(TimeZone::system())
+        .to_zoned(mpk_history::time::warsaw())
         .strftime(HOUR_FORMAT)
         .to_string()
 }
@@ -439,7 +438,7 @@ async fn period_cell(driver: &WebDriver, kind: &str, metric: &str) -> WebDriverR
 fn local(unix: i64) -> Zoned {
     Timestamp::from_second(unix)
         .unwrap()
-        .to_zoned(TimeZone::system())
+        .to_zoned(mpk_history::time::warsaw())
 }
 
 async fn visible_dots(figure: &WebElement) -> WebDriverResult<usize> {
