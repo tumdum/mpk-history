@@ -1359,6 +1359,18 @@ async fn recent_period(
     Ok((Caching::live()?, Redirect::temporary(&target)).into_response())
 }
 
+async fn period_has_positions(
+    state: &AppState,
+    selection: &Selection,
+    period: Period,
+) -> Result<bool> {
+    let (from, to) = period.bounds(&state.tz)?;
+    state
+        .db
+        .has_positions(selection.scope(), from.as_second(), to.as_second())
+        .await
+}
+
 async fn period_page(
     state: AppState,
     language: Language,
@@ -1373,6 +1385,9 @@ async fn period_page(
     let Some(selection) = key.resolve(&state.db).await? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
+    if !period_has_positions(&state, &selection, period).await? {
+        return Ok((Caching::live()?, Redirect::temporary(OVERVIEW_PATH)).into_response());
+    }
     let now = state.clock.now();
     let now_unix = now.as_second();
     let (from, to) = period.bounds(&state.tz)?;
@@ -1383,9 +1398,8 @@ async fn period_page(
     }
     let tr = language.translation();
     let subjects = selection.subjects(tr);
-    let groups = selection::groups(&subjects);
     let series = state
-        .period_totals(from_unix, to_unix, now_unix, &groups)
+        .period_totals(from_unix, to_unix, now_unix, &selection::groups(&subjects))
         .await?;
     let shown = selection::shown(&subjects, &series, |series| has_vehicles(series));
     let title = period.title(tr);
@@ -1397,6 +1411,7 @@ async fn period_page(
     let lines = state.db.lines_seen_between(from_unix, to_unix).await?;
     let page = Page::Period(period);
     let previous = period.previous()?;
+    let previous_has_data = period_has_positions(&state, &selection, previous).await?;
     let next = period.next()?;
     let next_started = next.start_date() <= state.today();
     let in_progress = (from_unix..to_unix).contains(&now_unix);
@@ -1431,8 +1446,10 @@ async fn period_page(
             }
             (selection::vehicles_nav(tr, &selection, page, &lines))
             nav .period-nav aria-label=(tr.text(Text::NeighbouringPeriods)) {
-                a #previous rel="prev" href=(selection.period_path(previous)) {
-                    (tr.neighbour(kind, Neighbour::Previous))
+                @if previous_has_data {
+                    a #previous rel="prev" href=(selection.period_path(previous)) {
+                        (tr.neighbour(kind, Neighbour::Previous))
+                    }
                 }
                 @if next_started {
                     a #next rel="next" href=(selection.period_path(next)) {
@@ -1751,7 +1768,19 @@ mod tests {
                 latitude: MicroDegrees(51_100_000 + north_e6),
                 longitude: MicroDegrees(17_000_000),
             };
-            db.save_positions(unix, &[&bus], &[]).await.unwrap();
+            db.save_positions_with_counts(
+                unix,
+                &[&bus],
+                &[],
+                &[LinePositionCount {
+                    vehicle_type: bus.vehicle_type,
+                    line: bus.line.clone(),
+                    received: 1,
+                    invalid: 0,
+                }],
+            )
+            .await
+            .unwrap();
             unix += FETCH_SECS;
             north_e6 += HUNDRED_METERS_NORTH_E6;
         }
@@ -1768,6 +1797,30 @@ mod tests {
             Request::get(uri).header(header::ACCEPT_LANGUAGE, accept_language),
         )
         .await
+    }
+
+    async fn record_period(db: &Db, period: Period) {
+        let (from, _) = period.bounds(&crate::time::warsaw()).unwrap();
+        let bus = Position {
+            vehicle_type: VehicleType::Bus,
+            line: BUS_LINE.to_owned(),
+            course_id: 1,
+            latitude: MicroDegrees(51_100_000),
+            longitude: MicroDegrees(17_000_000),
+        };
+        db.save_positions_with_counts(
+            from.as_second(),
+            &[&bus],
+            &[],
+            &[LinePositionCount {
+                vehicle_type: bus.vehicle_type,
+                line: bus.line.clone(),
+                received: 1,
+                invalid: 0,
+            }],
+        )
+        .await
+        .unwrap();
     }
 
     fn app_at(db: &Db, now_unix: i64, revision: Revision) -> Router {
@@ -2045,10 +2098,7 @@ mod tests {
             select_texts(&html, "#lines a[aria-current=page]"),
             [BUS_LINE]
         );
-        assert_eq!(
-            select_attributes(&html, "#previous", "href"),
-            [format!("{line_prefix}{}", week.previous().unwrap().path())]
-        );
+        assert!(select_attributes(&html, "#previous", "href").is_empty());
         let mut breadcrumbs = vec![line_prefix.clone()];
         breadcrumbs.extend(
             week.parents()
@@ -2541,34 +2591,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn earlier_periods_show_missing_values_and_link_forward() {
-        let db = db_with_a_bus().await;
-        let drive_day = containing_the_drive(PeriodKind::Day);
-        let yesterday = drive_day.previous().unwrap();
-        let html = get(&db, &yesterday.path()).await.body;
-        assert_eq!(
-            select_attributes(&html, "#period-stats thead th[data-kind]", "data-kind"),
-            ["all"]
-        );
-        for metric in Metric::ALL {
-            assert_eq!(period_cells(&html, metric), [MISSING_VALUE]);
+    async fn previous_period_links_require_data_for_the_selection() {
+        for kind in PeriodKind::ALL {
+            let db = db_with_a_bus().await;
+            let bus = Selection::Line(db.line(VehicleType::Bus, BUS_LINE).await.unwrap().unwrap());
+            let period = containing_the_drive(kind);
+            record_period(&db, period.next().unwrap()).await;
+            for selection in [&Selection::All, &Selection::Type(VehicleType::Bus), &bus] {
+                let html = get(&db, &selection.period_path(period)).await.body;
+                assert!(select_attributes(&html, "#previous", "href").is_empty());
+                let next = period.next().unwrap();
+                let html = get(&db, &selection.period_path(next)).await.body;
+                assert_eq!(
+                    select_attributes(&html, "#previous", "href"),
+                    [selection.period_path(period)]
+                );
+                assert_root_redirect(&get(&db, &selection.period_path(next.next().unwrap())).await);
+            }
+            let tram = Selection::Type(VehicleType::Tram);
+            assert_root_redirect(&get(&db, &tram.period_path(period.next().unwrap())).await);
         }
-        assert!(select_texts(&html, "#updated").is_empty());
-        assert_eq!(
-            select_attributes(&html, "#next", "href"),
-            [drive_day.path()]
-        );
-        assert_eq!(
-            select_attributes(&html, "#previous", "href"),
-            [yesterday.previous().unwrap().path()]
-        );
+    }
 
-        let long_ago = get(&db, "/year/1900").await;
-        assert_eq!(long_ago.status, StatusCode::OK);
+    #[tokio::test]
+    async fn previous_quality_period_links_use_quality_records() {
+        for kind in PeriodKind::ALL {
+            let db = db_with_quality_counts().await;
+            let bus = Selection::Line(db.line(VehicleType::Bus, BUS_LINE).await.unwrap().unwrap());
+            let period = Period::containing(kind, local_date(QUALITY_RECENTLY)).unwrap();
+            record_period(&db, period.next().unwrap()).await;
+            for selection in [&Selection::All, &Selection::Type(VehicleType::Bus), &bus] {
+                let html = get(&db, &selection.period_quality_path(period)).await.body;
+                assert!(select_attributes(&html, "#previous", "href").is_empty());
+                let next = period.next().unwrap();
+                let html = get(&db, &selection.period_quality_path(next)).await.body;
+                assert_eq!(
+                    select_attributes(&html, "#previous", "href"),
+                    [selection.period_quality_path(period)]
+                );
+                assert_root_redirect(
+                    &get(&db, &selection.period_quality_path(next.next().unwrap())).await,
+                );
+            }
+        }
+    }
+
+    fn assert_root_redirect(fetched: &Fetched) {
+        assert_eq!(fetched.status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(header_value(fetched, header::LOCATION), Some(OVERVIEW_PATH));
+        assert_eq!(header_value(fetched, header::ETAG), None);
         assert_eq!(
-            period_cells(&long_ago.body, Metric::Distance),
-            [MISSING_VALUE]
+            header_value(fetched, header::CACHE_CONTROL),
+            Some(LIVE_CACHE_CONTROL)
         );
+    }
+
+    #[tokio::test]
+    async fn empty_periods_redirect_to_root_even_with_conditional_requests() {
+        let db = db_with_a_bus().await;
+        let bus = Selection::Line(db.line(VehicleType::Bus, BUS_LINE).await.unwrap().unwrap());
+        for kind in PeriodKind::ALL {
+            let period = containing_the_drive(kind);
+            for selection in [&Selection::All, &Selection::Type(VehicleType::Bus), &bus] {
+                for empty in [period.previous().unwrap(), period.next().unwrap()] {
+                    for path in [
+                        selection.period_path(empty),
+                        selection.period_quality_path(empty),
+                    ] {
+                        assert_root_redirect(&get(&db, &path).await);
+                        assert_root_redirect(&get_if_none_match(&db, &path, "*").await);
+                    }
+                }
+            }
+            let tram = Selection::Type(VehicleType::Tram);
+            for path in [tram.period_path(period), tram.period_quality_path(period)] {
+                assert_root_redirect(&get(&db, &path).await);
+            }
+        }
+        assert_root_redirect(&get(&db, "/year/1900").await);
+        assert_eq!(get(&db, OVERVIEW_PATH).await.status, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -2647,7 +2748,7 @@ mod tests {
                 Some(LIVE_CACHE_CONTROL),
                 "{uri}"
             );
-            assert_eq!(get(&db, &target).await.status, StatusCode::OK, "{target}");
+            assert_root_redirect(&get(&db, &target).await);
         }
         assert_eq!(
             get(&db, "/bus/unknown/yesterday").await.status,
@@ -2722,6 +2823,7 @@ mod tests {
     #[tokio::test]
     async fn statistics_pages_link_to_data_quality() {
         let db = db_with_quality_counts().await;
+        record_period(&db, containing_the_drive(PeriodKind::Day)).await;
         let html = get(&db, "/").await.body;
         assert!(select_texts(&html, "#fetch-failures").is_empty());
         assert_eq!(
@@ -2832,10 +2934,7 @@ mod tests {
             select_attributes(&html, "#statistics-link", "href"),
             [day.path()]
         );
-        assert_eq!(
-            select_attributes(&html, "#previous", "href"),
-            [Selection::All.period_quality_path(day.previous().unwrap())]
-        );
+        assert!(select_attributes(&html, "#previous", "href").is_empty());
         let mut breadcrumbs = vec![OVERVIEW_QUALITY_PATH.to_owned()];
         breadcrumbs.extend(
             day.parents()
@@ -2874,13 +2973,7 @@ mod tests {
         assert_eq!(select_attributes(&html, "#parts a", "href"), days);
 
         let before = day.previous().unwrap().previous().unwrap();
-        let html = get(&db, &Selection::All.period_quality_path(before))
-            .await
-            .body;
-        assert_eq!(
-            select_attributes(&html, "#invalid-positions tbody tr", "data-kind"),
-            ["all"]
-        );
+        assert_root_redirect(&get(&db, &Selection::All.period_quality_path(before)).await);
         assert_eq!(
             get(&db, "/day/2027-13-01/quality").await.status,
             StatusCode::NOT_FOUND
@@ -2969,27 +3062,13 @@ mod tests {
             select_attributes(&html, "#statistics-link", "href"),
             [other.period_path(day)]
         );
-        assert_eq!(
-            select_attributes(&html, "#previous", "href"),
-            [other.period_quality_path(day.previous().unwrap())]
-        );
+        assert!(select_attributes(&html, "#previous", "href").is_empty());
         assert_eq!(
             select_attributes(&html, "#vehicles a", "href")[0],
             Selection::All.period_quality_path(day)
         );
 
-        let statistics = get(&db, &other.period_path(day)).await.body;
-        assert_eq!(
-            select_attributes(&statistics, "#quality-link", "href"),
-            [other.period_quality_path(day)]
-        );
-        for uri in [
-            "/bus/zzz/quality".to_owned(),
-            format!("/bus/zzz{}/quality", day.path()),
-            format!("/tram/{BUS_LINE}/quality"),
-        ] {
-            assert_eq!(get(&db, &uri).await.status, StatusCode::NOT_FOUND, "{uri}");
-        }
+        assert_root_redirect(&get(&db, &other.period_path(day)).await);
     }
 
     #[test]
@@ -3094,6 +3173,7 @@ mod tests {
     #[tokio::test]
     async fn translates_period_pages_and_charts() {
         let db = db_with_quality_counts().await;
+        record_period(&db, containing_the_drive(PeriodKind::Day)).await;
         let pl = Language::Polish.translation();
         let day = Period::containing(PeriodKind::Day, local_date(QUALITY_RECENTLY)).unwrap();
         let html = get_in(&db, &day.path(), POLISH_BROWSER).await.body;
@@ -3103,7 +3183,7 @@ mod tests {
             select_texts(&html, "#chart-average-speed figcaption"),
             [format!("Średnia prędkość (km/h), {title}")]
         );
-        assert_eq!(select_texts(&html, "#previous"), ["← Poprzedni dzień"]);
+        assert!(select_texts(&html, "#previous").is_empty());
         assert_eq!(select_texts(&html, "#quality-link"), ["Jakość danych"]);
 
         let quality = get_in(
@@ -3165,6 +3245,7 @@ mod tests {
     async fn ended_periods_are_not_sent_again_until_the_next_deploy() {
         let db = db_with_a_bus().await;
         let yesterday = containing_the_drive(PeriodKind::Day).previous().unwrap();
+        record_period(&db, yesterday).await;
         for path in [
             yesterday.path(),
             Selection::All.period_quality_path(yesterday),
@@ -3205,6 +3286,11 @@ mod tests {
     #[tokio::test]
     async fn each_language_has_its_own_etag() {
         let db = db_with_a_bus().await;
+        record_period(
+            &db,
+            containing_the_drive(PeriodKind::Day).previous().unwrap(),
+        )
+        .await;
         let path = containing_the_drive(PeriodKind::Day)
             .previous()
             .unwrap()

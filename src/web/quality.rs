@@ -1,6 +1,6 @@
 use anyhow::Result;
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use maud::{Markup, html};
 
 use super::caching::{Caching, IfNoneMatch};
@@ -537,6 +537,14 @@ pub(super) async fn overview(
     Ok(shell(language, Caching::live()?, &head, &body))
 }
 
+async fn period_has_data(state: &AppState, selection: &Selection, period: Period) -> Result<bool> {
+    let (from, to) = period.bounds(&state.tz)?;
+    state
+        .db
+        .has_quality_data(selection.scope(), from.as_second(), to.as_second())
+        .await
+}
+
 pub(super) async fn period_page(
     state: AppState,
     language: Language,
@@ -551,6 +559,9 @@ pub(super) async fn period_page(
     let Some(selection) = key.resolve(&state.db).await? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
+    if !period_has_data(&state, &selection, period).await? {
+        return Ok((Caching::live()?, Redirect::temporary(super::OVERVIEW_PATH)).into_response());
+    }
     let now = state.clock.now();
     let (from, to) = period.bounds(&state.tz)?;
     let window = (from.as_second(), to.as_second());
@@ -580,6 +591,7 @@ pub(super) async fn period_page(
     let lines = state.db.lines_seen_between(window.0, window.1).await?;
     let page = Page::QualityPeriod(period);
     let previous = period.previous()?;
+    let previous_has_data = period_has_data(&state, &selection, previous).await?;
     let next = period.next()?;
     let next_started = next.start_date() <= state.today();
     let in_progress = (window.0..window.1).contains(&now.as_second());
@@ -609,8 +621,10 @@ pub(super) async fn period_page(
             }
             (selection::vehicles_nav(tr, &selection, page, &lines))
             nav .period-nav aria-label=(tr.text(Text::NeighbouringPeriods)) {
-                a #previous rel="prev" href=(selection.period_quality_path(previous)) {
-                    (tr.neighbour(kind, Neighbour::Previous))
+                @if previous_has_data {
+                    a #previous rel="prev" href=(selection.period_quality_path(previous)) {
+                        (tr.neighbour(kind, Neighbour::Previous))
+                    }
                 }
                 @if next_started {
                     a #next rel="next" href=(selection.period_quality_path(next)) {

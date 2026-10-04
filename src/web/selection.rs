@@ -7,7 +7,7 @@ use super::period::Period;
 use super::quality::{OVERVIEW_QUALITY_PATH, QUALITY_SEGMENT};
 use super::{OVERVIEW_PATH, Range, kind_color, kind_slug};
 use crate::charts::RGBColor;
-use crate::db::{Db, StoredLine};
+use crate::db::{Db, StoredLine, VehicleScope};
 use crate::mpk::VehicleType;
 use crate::stats::{Group, Kind};
 
@@ -40,6 +40,14 @@ pub(super) enum Selection {
 }
 
 impl Selection {
+    pub(super) fn scope(&self) -> VehicleScope {
+        match self {
+            Selection::All => VehicleScope::All,
+            Selection::Type(vehicle_type) => VehicleScope::Type(*vehicle_type),
+            Selection::Line(line) => VehicleScope::Line(line.id),
+        }
+    }
+
     fn prefix(&self) -> String {
         match self {
             Selection::All => String::new(),

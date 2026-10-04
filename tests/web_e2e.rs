@@ -671,7 +671,7 @@ async fn arrow_keys_move_between_chart_steps() {
 #[tokio::test]
 async fn calendar_pages_show_statistics_of_their_period() {
     in_browser(|driver, url| async move {
-        driver.goto(url).await?;
+        driver.goto(&url).await?;
         driver
             .find(By::LinkText("This week"))
             .await?
@@ -751,16 +751,12 @@ async fn calendar_pages_show_statistics_of_their_period() {
             .find(By::Css(format!(".breadcrumbs a[href='{week_path}']")))
             .await?;
 
-        driver.find(By::Id("previous")).await?.click().await?;
+        assert!(driver.find_all(By::Id("previous")).await?.is_empty());
         let previous_day = drive_day.yesterday().unwrap();
-        assert_eq!(
-            current_path(&driver).await?,
-            format!("/day/{}", previous_day.strftime("%Y-%m-%d"))
-        );
-        assert_eq!(
-            driver.find(By::Id("next")).await?.attr("href").await?,
-            Some(day_path)
-        );
+        driver
+            .goto(format!("{}/day/{}", url, previous_day.strftime("%Y-%m-%d")))
+            .await?;
+        assert_eq!(current_path(&driver).await?, "/");
         Ok(())
     })
     .await;
@@ -935,7 +931,7 @@ async fn pages_follow_the_language_of_the_browser() {
 
         click(&driver, "#history a").await?;
         assert!(current_path(&driver).await?.starts_with("/day/"));
-        assert_eq!(text(&driver, "#previous").await?, "← Poprzedni dzień");
+        assert!(driver.find_all(By::Id("previous")).await?.is_empty());
         driver
             .find(By::LinkText("Jakość danych"))
             .await?

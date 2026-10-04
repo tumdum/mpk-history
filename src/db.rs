@@ -24,6 +24,13 @@ pub enum OpenMode {
     ExistingAsIs,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum VehicleScope {
+    All,
+    Type(VehicleType),
+    Line(i64),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredLine {
     pub id: i64,
@@ -778,6 +785,69 @@ impl Db {
                 },
             )
             .collect()
+    }
+
+    pub async fn has_positions(
+        &self,
+        scope: VehicleScope,
+        from_unix: i64,
+        to_unix: i64,
+    ) -> Result<bool> {
+        let (condition, value) = match scope {
+            VehicleScope::All => ("TRUE", None),
+            VehicleScope::Type(vehicle_type) => ("l.vehicle_type = ?3", Some(vehicle_type.id())),
+            VehicleScope::Line(line_id) => ("l.id = ?3", Some(line_id)),
+        };
+        let sql = format!(
+            "SELECT EXISTS (SELECT 1 FROM lines l WHERE {condition} \
+             AND EXISTS (SELECT 1 FROM vehicle_positions p WHERE p.line_id = l.id \
+                         AND p.first_seen_unix >= ?1 AND p.first_seen_unix < ?2))"
+        );
+        let mut query = sqlx::query_scalar(&sql).bind(from_unix).bind(to_unix);
+        if let Some(value) = value {
+            query = query.bind(value);
+        }
+        Ok(query.fetch_one(&self.pool).await?)
+    }
+
+    pub async fn has_quality_data(
+        &self,
+        scope: VehicleScope,
+        from_unix: i64,
+        to_unix: i64,
+    ) -> Result<bool> {
+        let (type_ids, source_ids): (Vec<i64>, Vec<i64>) = match scope {
+            VehicleScope::All => (
+                VehicleType::ALL.iter().map(|kind| kind.id()).collect(),
+                Source::ALL.iter().map(|source| source.id()).collect(),
+            ),
+            VehicleScope::Type(vehicle_type) => (vec![vehicle_type.id()], Vec::new()),
+            VehicleScope::Line(line_id) => {
+                return Ok(sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM line_position_counts \
+                     WHERE line_id = ?1 AND minute_unix >= ?2 AND minute_unix < ?3 AND received > 0)",
+                )
+                .bind(line_id)
+                .bind(from_unix)
+                .bind(to_unix)
+                .fetch_one(&self.pool)
+                .await?);
+            }
+        };
+        Ok(sqlx::query_scalar(
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM fetch_attempts \
+                 WHERE source IN (SELECT value FROM json_each(?1)) \
+                   AND minute_unix >= ?3 AND minute_unix < ?4 AND attempts > 0) \
+             THEN 1 ELSE EXISTS (SELECT 1 FROM position_counts \
+                 WHERE vehicle_type IN (SELECT value FROM json_each(?2)) \
+                   AND minute_unix >= ?3 AND minute_unix < ?4 AND received > 0) END",
+        )
+        .bind(serde_json::to_string(&source_ids)?)
+        .bind(serde_json::to_string(&type_ids)?)
+        .bind(from_unix)
+        .bind(to_unix)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     pub async fn first_seen_unix(&self) -> Result<Option<i64>> {
@@ -1887,6 +1957,121 @@ mod tests {
             ]
         );
         assert_eq!(line_count(&db).await, 3);
+    }
+
+    #[tokio::test]
+    async fn position_existence_respects_scope_and_period_bounds() {
+        const SEEN: i64 = 1_800_000_000;
+        const BEFORE: i64 = SEEN - 1;
+        const AFTER: i64 = SEEN + 1;
+        let db = open().await;
+        assert!(
+            !db.has_positions(VehicleScope::All, BEFORE, AFTER)
+                .await
+                .unwrap()
+        );
+        let bus = position(VehicleType::Bus, "a", 1);
+        let other = position(VehicleType::Bus, "b", 2);
+        db.save_positions(BEFORE, &[&other], &[]).await.unwrap();
+        db.save_positions(SEEN, &[&bus], &[]).await.unwrap();
+        let bus_id = db.line(VehicleType::Bus, "a").await.unwrap().unwrap().id;
+        let other_id = db.line(VehicleType::Bus, "b").await.unwrap().unwrap().id;
+        for (scope, expected) in [
+            (VehicleScope::All, true),
+            (VehicleScope::Type(VehicleType::Bus), true),
+            (VehicleScope::Type(VehicleType::Tram), false),
+            (VehicleScope::Line(bus_id), true),
+            (VehicleScope::Line(other_id), false),
+        ] {
+            assert_eq!(
+                db.has_positions(scope, SEEN, AFTER).await.unwrap(),
+                expected,
+                "{scope:?}"
+            );
+        }
+        assert!(
+            !db.has_positions(VehicleScope::Line(bus_id), BEFORE, SEEN)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.has_positions(VehicleScope::All, AFTER, AFTER)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn quality_existence_respects_scope_counts_and_period_bounds() {
+        const MINUTE: i64 = 1_800_000_000;
+        let next = MINUTE + duration_secs(COUNT_BUCKET);
+        let db = open().await;
+        assert!(
+            !db.has_quality_data(VehicleScope::All, MINUTE, next)
+                .await
+                .unwrap()
+        );
+        db.save_fetch_outcome(Source::MpkPositions, MINUTE, None)
+            .await
+            .unwrap();
+        assert!(
+            db.has_quality_data(VehicleScope::All, MINUTE, next)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.has_quality_data(VehicleScope::Type(VehicleType::Bus), MINUTE, next)
+                .await
+                .unwrap()
+        );
+        let counts = [
+            LinePositionCount {
+                vehicle_type: VehicleType::Bus,
+                line: "a".to_owned(),
+                received: 1,
+                invalid: 1,
+            },
+            LinePositionCount {
+                vehicle_type: VehicleType::Bus,
+                line: "b".to_owned(),
+                received: 0,
+                invalid: 0,
+            },
+        ];
+        db.save_positions_with_counts(next, &[], &[], &counts)
+            .await
+            .unwrap();
+        let end = next + duration_secs(COUNT_BUCKET);
+        let bus_id = db.line(VehicleType::Bus, "a").await.unwrap().unwrap().id;
+        let other_id = db.line(VehicleType::Bus, "b").await.unwrap().unwrap().id;
+        for (scope, expected) in [
+            (VehicleScope::All, true),
+            (VehicleScope::Type(VehicleType::Bus), true),
+            (VehicleScope::Type(VehicleType::Tram), false),
+            (VehicleScope::Line(bus_id), true),
+            (VehicleScope::Line(other_id), false),
+        ] {
+            assert_eq!(
+                db.has_quality_data(scope, next, end).await.unwrap(),
+                expected,
+                "{scope:?}"
+            );
+            assert!(
+                !db.has_quality_data(scope, end, end + duration_secs(COUNT_BUCKET))
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(
+            !db.has_quality_data(VehicleScope::Line(bus_id), MINUTE, next)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.has_positions(VehicleScope::All, MINUTE, end)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

@@ -145,13 +145,17 @@ mod tests {
 
     use super::*;
     use crate::db::{Db, OpenMode};
+    use crate::fetch::Source;
+    use crate::geo::MicroDegrees;
     use crate::map::Basemap;
+    use crate::mpk::{Position, VehicleType};
     use crate::web::caching::{Caching, Revision};
     use crate::web::map::SharedBasemap;
     use crate::web::{Clock, app};
 
     const NOW: &str = "2026-09-30T12:00:00Z";
     const HISTORICAL_PAGE: &str = "/day/2026-09-27";
+    const HISTORICAL_SEEN: &str = "2026-09-27T12:00:00Z";
     const TEST_COMMIT: &str = "test-commit";
     const CAPACITY: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 
@@ -159,6 +163,27 @@ mod tests {
         let db = Db::open(Path::new(":memory:"), OpenMode::CreateIfMissing)
             .await
             .unwrap();
+        let bus = Position {
+            vehicle_type: VehicleType::Bus,
+            line: "a".to_owned(),
+            course_id: 1,
+            latitude: MicroDegrees(51_100_000),
+            longitude: MicroDegrees(17_000_000),
+        };
+        db.save_positions(
+            HISTORICAL_SEEN.parse::<Timestamp>().unwrap().as_second(),
+            &[&bus],
+            &[],
+        )
+        .await
+        .unwrap();
+        db.save_fetch_outcome(
+            Source::MpkPositions,
+            HISTORICAL_SEEN.parse::<Timestamp>().unwrap().as_second(),
+            None,
+        )
+        .await
+        .unwrap();
         AppState {
             basemap: SharedBasemap::ready(Basemap::empty()),
             revision: Revision::Commit(TEST_COMMIT),
@@ -323,6 +348,8 @@ mod tests {
         let app = app(state.clone());
         for uri in [
             "/yesterday",
+            "/day/1900-01-01",
+            "/day/1900-01-01/quality",
             "/missing",
             "/?range=invalid",
             "/bus/unknown",
