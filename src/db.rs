@@ -217,7 +217,7 @@ pub enum PositionFilter<'a> {
 impl PositionFilter<'_> {
     fn condition(&self) -> &'static str {
         match self {
-            PositionFilter::All => "TRUE",
+            PositionFilter::All => "line_id IN (SELECT id FROM lines)",
             PositionFilter::Line(_) => "line_id IN (SELECT id FROM lines WHERE name = ?1)",
             PositionFilter::Plate(_) => {
                 "line_id IN (SELECT line_id FROM course_vehicles WHERE plate = ?1) \

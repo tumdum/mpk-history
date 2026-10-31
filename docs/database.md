@@ -214,8 +214,10 @@ Rules the rows follow:
   PLATE and BRIGADE columns of `query`, but inference and `query --plate` don't use
   them.
 
-Indexes: the primary key (`course_id` first), `course_vehicles_side_number`, and
-`course_vehicles_plate`.
+Indexes: the primary key (`course_id` first), `course_vehicles_side_number`,
+`course_vehicles_plate`, and `course_vehicles_inferred_from` on
+`inferred_from_course_id` for rows where it is not NULL. The last index supports
+following and correcting inference chains.
 
 ### `weather_observations`
 
@@ -319,13 +321,17 @@ Index: `fetch_errors_source_started (source, started_unix)`.
 
 | Query | Index used |
 |---|---|
-| `query --line`, fleet matching, inference summaries, speed, web statistics | `vehicle_positions_line_first_seen` |
+| Live map, `query --line`, fleet matching, inference summaries, speed, web statistics | `vehicle_positions_line_first_seen` |
 | `query --plate` | `course_vehicles_plate`, then `vehicle_positions_line_first_seen` |
 | SIDE / PLATE / BRIGADE columns | `course_vehicles` primary key |
+| Following and correcting inference chains | `course_vehicles_inferred_from` |
 | Tracker updates | `vehicle_positions` primary key |
 | Line lookup by name | `lines_name` |
 | `bbox` | none, it reads the whole table. This is fine for an occasional command |
 | Data quality on the web page | `fetch_attempts`, `position_counts` and `line_position_counts` primary keys |
+
+The live map enumerates line IDs before filtering by time, so it can search the
+existing line/time index without scanning the full history.
 
 ## Size
 
@@ -359,6 +365,7 @@ GROUP BY day;
 | `0013_fetch_errors` | Failed downloads table | |
 | `0014_quality_counts` | `fetch_attempts` and `position_counts` | |
 | `0015_line_position_counts` | `line_position_counts` | |
+| `0016_course_vehicles_inferred_from` | Partial index on inferred parent course | |
 
 Before starting a new binary whose new migrations **rebuild a table**, stop the
 running collector. An old collector writing into a rebuilt table fails on every fetch.
