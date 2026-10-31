@@ -1598,6 +1598,24 @@ async fn get_when_ready(client: &reqwest::Client, url: &str) -> reqwest::Respons
     }
 }
 
+async fn summary_when_ready(client: &reqwest::Client, url: &str) -> Html {
+    let started = Instant::now();
+    let ready = Selector::parse(SUMMARY_UPDATED_SELECTOR).unwrap();
+    loop {
+        let response = get_when_ready(client, url).await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let html = Html::parse_document(&response.text().await.unwrap());
+        if html.select(&ready).next().is_some() {
+            return html;
+        }
+        assert!(
+            started.elapsed() < SUMMARY_READY_TIMEOUT,
+            "summary did not become ready at {url}"
+        );
+        tokio::time::sleep(SERVER_POLL_INTERVAL).await;
+    }
+}
+
 fn collect(database: &Path, web: &str, address: &str, dead_proxy: &str) -> RunningServer {
     let child = Command::new(BINARY)
         .arg("--database")
@@ -1660,9 +1678,9 @@ async fn collect_serves_the_web_page_until_terminated() {
     let mut server = collect(&database.path, "enabled", &address, &dead_proxy());
     let client = local_client();
 
-    let page = get_when_ready(&client, &format!("http://{address}/")).await;
-    assert_eq!(page.status(), reqwest::StatusCode::OK);
-    assert!(page.text().await.unwrap().contains("id=\"stats-all\""));
+    let page = summary_when_ready(&client, &format!("http://{address}{OVERVIEW_PATH}")).await;
+    let all_vehicles = Selector::parse(&format!("#stats-{KIND_ALL}")).unwrap();
+    assert!(page.select(&all_vehicles).next().is_some());
     let chart = client
         .get(format!(
             "http://{address}/charts/average-speed.svg?range=month"
