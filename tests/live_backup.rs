@@ -95,6 +95,9 @@ const HISTORY_RESOLUTION: Duration = Duration::from_mins(15);
 const LOCALHOST: &str = "127.0.0.1";
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
 const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const SUMMARY_READY_TIMEOUT: Duration = Duration::from_secs(120);
+const OVERVIEW_PATH: &str = "/";
+const SUMMARY_UPDATED_SELECTOR: &str = "#summary-updated";
 const SVG_CONTENT_TYPE: &str = "image/svg+xml";
 const TERMINATE_SIGNAL: &str = "-TERM";
 
@@ -1278,14 +1281,30 @@ async fn vehicle_types_seen(db: &SqlitePool, from_unix: i64, to_unix: i64) -> Ve
 async fn web_page(database: &Path, uri: &str, now_unix: i64) -> Html {
     let db = Db::open(database, OpenMode::MustExist).await.unwrap();
     let clock = Clock::Fixed(Timestamp::from_second(now_unix).unwrap());
-    let response = web::router(db.clone(), clock)
-        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK, "{uri}");
-    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let app = web::router(db.clone(), clock);
+    let started = Instant::now();
+    let ready = Selector::parse(SUMMARY_UPDATED_SELECTOR).unwrap();
+    let html = loop {
+        let response = app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = Html::parse_document(std::str::from_utf8(&body).unwrap());
+        if uri != OVERVIEW_PATH || html.select(&ready).next().is_some() {
+            break html;
+        }
+        assert!(
+            started.elapsed() < SUMMARY_READY_TIMEOUT,
+            "summary did not become ready"
+        );
+        tokio::time::sleep(SERVER_POLL_INTERVAL).await;
+    };
+    drop(app);
     db.close().await;
-    Html::parse_document(std::str::from_utf8(&body).unwrap())
+    html
 }
 
 async fn computed_totals(

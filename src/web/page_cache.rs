@@ -184,12 +184,14 @@ mod tests {
         )
         .await
         .unwrap();
-        AppState {
+        let state = AppState {
             basemap: SharedBasemap::ready(Basemap::empty()),
             revision: Revision::Commit(TEST_COMMIT),
             pages: Arc::new(PageCache::new(CAPACITY)),
             ..AppState::new(db, Clock::Fixed(NOW.parse().unwrap()))
-        }
+        };
+        state.summary.wait_until_ready().await;
+        state
     }
 
     fn key(uri: &str, language: Language) -> PageKey {
@@ -232,6 +234,24 @@ mod tests {
                 expected.deadline(started)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn does_not_cache_an_overview_before_its_summary_is_ready() {
+        let mut state = state().await;
+        state.summary = super::super::summary::Cache::new(state.db.clone(), state.clock);
+        let first = request(app(state.clone()), "/", Language::English).await;
+        assert!(state.pages.0.lock().is_empty());
+        let first = body(first).await;
+        assert!(
+            std::str::from_utf8(&first)
+                .unwrap()
+                .contains("Summary statistics are being prepared.")
+        );
+        state.summary.wait_until_ready().await;
+        let ready = request(app(state.clone()), "/", Language::English).await;
+        assert!(state.pages.0.lock().contains(&key("/", Language::English)));
+        assert_ne!(body(ready).await, first);
     }
 
     #[tokio::test]

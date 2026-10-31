@@ -32,6 +32,7 @@ mod period;
 mod quality;
 mod selection;
 mod speed_map;
+mod summary;
 
 use about::ABOUT_PATH;
 use caching::{Caching, IfNoneMatch, Revision};
@@ -505,10 +506,12 @@ struct AppState {
     revision: Revision,
     basemap: SharedBasemap,
     pages: Arc<PageCache>,
+    summary: summary::Cache,
 }
 
 impl AppState {
     fn new(db: Db, clock: Clock) -> Self {
+        let summary = summary::Cache::new(db.clone(), clock);
         Self {
             db,
             recent: Arc::new(StatsCache::new(
@@ -532,6 +535,7 @@ impl AppState {
             revision: Revision::current(),
             basemap: SharedBasemap::default(),
             pages: Arc::new(PageCache::new(DEFAULT_PAGE_CACHE_CAPACITY)),
+            summary,
         }
     }
 
@@ -539,7 +543,7 @@ impl AppState {
         let started = Instant::now();
         let now_unix = self.clock.now().as_second();
         let recent = [
-            (&self.recent, Range::LONGEST),
+            (&self.recent, Range::default()),
             (&self.recent_lines, LINE_MINUTES_RANGE),
         ];
         for (cache, range) in recent {
@@ -640,6 +644,27 @@ impl AppState {
         }
         ranges.reverse();
         Ok(ranges)
+    }
+
+    async fn summary_table(
+        &self,
+        groups: &[Group],
+        now_unix: i64,
+    ) -> Result<Option<summary::Table>> {
+        if groups.iter().all(|group| matches!(group, Group::Kind(_))) {
+            return Ok(self.summary.table(groups));
+        }
+        let ranges = self.recent_ranges(groups, now_unix).await?;
+        let mut rows = vec![Vec::with_capacity(ranges.len()); groups.len()];
+        for (range, totals) in ranges {
+            for (rows, series) in rows.iter_mut().zip(totals.series) {
+                rows.push((range, stats::sum(&series)));
+            }
+        }
+        Ok(Some(summary::Table {
+            at_unix: now_unix,
+            rows,
+        }))
     }
 
     async fn period_totals(
@@ -1128,9 +1153,10 @@ pub async fn serve(
         pages: Arc::new(PageCache::new(page_cache_capacity)),
         ..AppState::new(db, clock)
     };
-    tokio::spawn(state.clone().warm_up());
+    let mut background = tokio::task::JoinSet::new();
+    background.spawn(state.clone().warm_up());
     if let MapTiles::Download(client) = tiles {
-        tokio::spawn(state.basemap.clone().download(client));
+        background.spawn(state.basemap.clone().download(client));
     }
     axum::serve(listener, app(state))
         .with_graceful_shutdown(shutdown)
@@ -1173,16 +1199,7 @@ async fn overview(
     let now_unix = now.as_second();
     let subjects = selection.subjects(tr);
     let groups = selection::groups(&subjects);
-    let ranges = state.recent_ranges(&groups, now_unix).await?;
-    let mut rows = vec![Vec::with_capacity(ranges.len()); subjects.len()];
-    for (range, totals) in &ranges {
-        for (rows, series) in rows.iter_mut().zip(&totals.series) {
-            rows.push((*range, stats::sum(series)));
-        }
-    }
-    let tables = selection::shown(&subjects, &rows, |rows: &Vec<(Range, Totals)>| {
-        rows.iter().any(|(_, totals)| totals.has_vehicles())
-    });
+    let summary = state.summary_table(&groups, now_unix).await?;
     let chart = state.recent_range(&groups, selected, now_unix).await?;
     let shown = selection::shown(&subjects, &chart.series, |series| has_vehicles(series));
     let labels = ChartLabels::new(tr, selected.chart(), &state.tz);
@@ -1240,12 +1257,7 @@ async fn overview(
                 a #quality-link href=(selection.quality_path()) { (tr.text(Text::DataQuality)) }
                 a #about-link href=(ABOUT_PATH) { (tr.text(Text::About)) }
             }
-            section #summary {
-                h2 { (tr.text(Text::Summary)) }
-                @for (subject, rows) in &tables {
-                    (range_table(tr, subject, rows))
-                }
-            }
+            (summary::section(tr, &subjects, summary.as_ref(), &state.tz)?)
             (selection::lines_section(tr, &selection, page, &lines))
         }
     };
@@ -1256,7 +1268,11 @@ async fn overview(
             Selection::Type(_) | Selection::Line(_) => page_title(tr, &heading),
         },
     };
-    Ok(shell(language, Caching::live()?, &head, &body))
+    let mut response = shell(language, Caching::live()?, &head, &body);
+    if summary.is_none() {
+        response.extensions_mut().remove::<page_cache::Validity>();
+    }
+    Ok(response)
 }
 
 fn history_links(today: Date) -> Result<Vec<(Relative, Period)>> {
@@ -1866,7 +1882,15 @@ mod tests {
     }
 
     async fn send(db: &Db, request: axum::http::request::Builder) -> Fetched {
-        send_to(app_at(db, NOW, Revision::Commit(TEST_COMMIT)), request).await
+        let state = AppState {
+            revision: Revision::Commit(TEST_COMMIT),
+            ..AppState::new(
+                db.clone(),
+                Clock::Fixed(Timestamp::from_second(NOW).unwrap()),
+            )
+        };
+        state.summary.wait_until_ready().await;
+        send_to(app(state), request).await
     }
 
     async fn send_to(app: Router, request: axum::http::request::Builder) -> Fetched {
@@ -1960,6 +1984,36 @@ mod tests {
     const BUS_LINE: &str = "a";
     const OTHER_BUS_LINE: &str = "b";
     const TRAM_LINE: &str = "1";
+
+    #[tokio::test]
+    async fn overview_uses_the_published_summary_while_charts_read_new_positions() {
+        let db = db_with_a_bus().await;
+        let state = AppState::new(
+            db.clone(),
+            Clock::Fixed(Timestamp::from_second(NOW).unwrap()),
+        );
+        state.summary.wait_until_ready().await;
+        let tram = Position {
+            vehicle_type: VehicleType::Tram,
+            line: TRAM_LINE.to_owned(),
+            course_id: 2,
+            latitude: MicroDegrees(51_100_000),
+            longitude: MicroDegrees(17_000_000),
+        };
+        db.save_positions(NOW - FETCH_SECS, &[&tram], &[])
+            .await
+            .unwrap();
+        let page = send_to(app(state), Request::get(OVERVIEW_PATH)).await;
+        assert_eq!(tables(&page.body), ["stats-all", "stats-bus"]);
+        assert_eq!(
+            series_names(&hover_data(&page.body, Metric::AverageVehicles.slug())),
+            ["All vehicles", "Buses", "Trams"]
+        );
+        assert_eq!(
+            select_attributes(&page.body, "#summary-updated time", "datetime"),
+            [Timestamp::from_second(NOW).unwrap().to_string()]
+        );
+    }
 
     async fn db_with_a_bus_and_a_tram() -> Db {
         let db = db_with_a_bus().await;

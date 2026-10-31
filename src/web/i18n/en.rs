@@ -31,6 +31,7 @@ impl Translation for English {
             Text::Pages => "Pages",
             Text::DataQuality => "Data quality",
             Text::Summary => "Summary",
+            Text::PreparingStatistics => "Summary statistics are being prepared.",
             Text::NeighbouringPeriods => "Neighbouring periods",
             Text::Metric => "Metric",
             Text::Vehicles => "Vehicles",

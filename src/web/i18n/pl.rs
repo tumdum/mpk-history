@@ -102,6 +102,7 @@ impl Translation for Polish {
             Text::Pages => "Strony",
             Text::DataQuality => "Jakość danych",
             Text::Summary => "Podsumowanie",
+            Text::PreparingStatistics => "Statystyki podsumowania są przygotowywane.",
             Text::NeighbouringPeriods => "Sąsiednie okresy",
             Text::Metric => "Wskaźnik",
             Text::Vehicles => "Pojazdy",

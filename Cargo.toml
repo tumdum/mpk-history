@@ -31,6 +31,7 @@ liblzma = { version = "0.4.8", features = ["static"] }
 rstest = { version = "0.27.0", default-features = false }
 serde_json = "1.0.151"
 tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["test-util"] }
 thirtyfour = "0.37.5"
 tower = { version = "0.5.3", features = ["util"] }
 

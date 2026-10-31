@@ -330,11 +330,25 @@ the least recently used entry is evicted when the cache is full. No pages are
 prefilled or refreshed in the background. Restarting clears this cache, including
 historical pages if old data has been imported.
 
+The overview summary for all vehicles and vehicle types is computed in the
+background immediately at startup and every 15 minutes afterwards. Each refresh
+prepares all hour/day/week/month totals and publishes them together. Pages use the
+last completed result while another refresh runs; a failed refresh keeps that
+result. The summary has its own "as of" time. Before the first result is ready,
+pages show a preparation message and are not added to the rendered HTML cache.
+Already-cached pages can show the previous summary until their one-minute expiry.
+Line summaries are still calculated when requested.
+
+The summary worker has its own statistics cache so its month-long computation
+does not hold the chart cache's lock. It stops when the server's last reader is
+dropped. These summaries are kept in memory and are recomputed after a restart.
+
 The server keeps totals in memory in these caches:
 
 | Cache | Resolution | Keeps | Used by |
 |---|---|---|---|
 | Recent | 1 minute | the last 30 days, totals per vehicle type only | the overview |
+| Summary | 1 minute | the last 30 days, totals per vehicle type only | background overview summary refresh |
 | Recent lines | 1 minute | the last day, also totals per line | the last hour and day of a line |
 | History | 15 minutes | everything, also totals per line: about 75 MB per year of data | calendar pages; the last week and month of a line |
 | Speed map | 1 local day | everything, totals per hexagon and line: about 240 KB per day, 90 MB per year of data | the speed map of calendar pages |
@@ -345,10 +359,11 @@ from the history cache, so they start at the quarter hour before the exact time.
 all vehicles and vehicle types they start at the minute.
 
 A step can reach up to 11 minutes back, so a bucket is kept once it ended at least 12
-minutes ago; later buckets are computed again on each request. At start the server
-computes the last 30 days, the last day with lines, all history, and then the speed
-map of all days in the background, in 6-hour chunks. A day of the speed map is kept
-once it ended at least 12 minutes ago. Each chunk is one query on the shared connection, so the
+minutes ago; later buckets are computed again on each request or summary refresh.
+At start the server warms the last day for overview charts, the last day with
+lines, all history, and then the speed map of all days in the background, in
+6-hour chunks. The separate summary worker computes the last 30 days. A day of the
+speed map is kept once it ended at least 12 minutes ago. Each chunk is one query on the shared connection, so the
 collector waits at most for one chunk. A year of data takes a few minutes for the
 history and a few more for the speed map; until they are done, calendar pages and the
 last week and month of a line wait for them. Nothing is

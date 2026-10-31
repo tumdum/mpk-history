@@ -135,6 +135,7 @@ pub(super) enum Text {
     Pages,
     DataQuality,
     Summary,
+    PreparingStatistics,
     NeighbouringPeriods,
     Metric,
     Vehicles,
