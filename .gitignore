@@ -2,3 +2,8 @@
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+*.lz4
+*.capnp
+*.zst
+*.gz
+*.xz
